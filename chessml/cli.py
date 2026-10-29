@@ -23,6 +23,15 @@ def _add_training_args(p: argparse.ArgumentParser) -> None:
     d.add_argument("--games", type=int, help="stop after N self-play games")
     d.add_argument("--time", help="stop after a wall-clock time such as 2h, 90m, 1h30m")
     d.add_argument("--until-stop", action="store_true", help="run until Ctrl+C (default)")
+    o = p.add_argument_group("opponent (default: self-play only)")
+    o.add_argument("--engine-share", type=float, metavar="FRACTION",
+                   help="share of games played against Stockfish, 0-1 (e.g. 0.5; 1 = engine games only)")
+    o.add_argument("--engine-path", help="UCI engine binary (default: $CHESSML_ENGINE or stockfish on PATH)")
+    o.add_argument("--engine-level", type=int, help="engine strength 0-20 to start from (default 0)")
+    o.add_argument("--engine-fixed", action="store_true", help="keep the engine level fixed instead of adapting it")
+    o.add_argument("--engine-time", type=float, help="seconds of engine search per move (default 0.02)")
+    o.add_argument("--no-imitate", action="store_true",
+                   help="do not train on the engine's positions (learn only from the network's own moves)")
     r = p.add_argument_group("run")
     r.add_argument("--resume", metavar="RUN_OR_CHECKPOINT",
                    help="continue a run (name or path) or start a new run from a checkpoint file")
@@ -47,8 +56,12 @@ def config_from_args(args) -> TrainConfig:
         "checkpoint_minutes": args.checkpoint_minutes, "eval_minutes": args.eval_minutes,
         "eval_games": args.eval_games, "seed": args.seed,
         "max_games": args.games, "max_seconds": parse_duration(args.time) if args.time else None,
+        "engine_share": args.engine_share, "engine_path": args.engine_path, "engine_level": args.engine_level,
+        "engine_time": args.engine_time,
+        "engine_adaptive": False if args.engine_fixed else None, "engine_imitate": False if args.no_imitate else None,
     }
     return TrainConfig.from_preset(args.preset, **overrides)
+
 
 
 class ConsolePrinter:
@@ -72,15 +85,27 @@ class ConsolePrinter:
             loss = (f"loss {self.loss['total_loss']:.3f} (policy {self.loss['policy_loss']:.3f}, "
                     f"value {self.loss['value_loss']:.3f})" if self.loss else "loss -")
             eta = f" | eta {format_duration(event['eta'])}" if event.get("eta") is not None else ""
+            engine = ""
+            if event.get("engine_share"):
+                score = event.get("engine_score")
+                engine = (f" | stockfish level {event['engine_level']}"
+                          + (f", score {100 * score:.0f}%" if score is not None else ""))
             print(f"[{format_duration(event['elapsed'])}] {event['state']} | games {event['games']} "
                   f"({event['games_per_sec']:.2f}/s) | steps {event['steps']} | {loss} | "
-                  f"buffer {event['buffer']}{eta}", flush=True)
+                  f"buffer {event['buffer']}{engine}{eta}", flush=True)
 
 
 def cmd_train(args) -> int:
     from .trainer import Control, Trainer
 
+    from .engine import check_engine_config
+
     cfg = config_from_args(args)
+    try:
+        check_engine_config(cfg)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     control = Control()
     presses = 0
 
@@ -97,7 +122,8 @@ def cmd_train(args) -> int:
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
     print(f"Training: preset {cfg.preset} ({CPU_COUNT} CPUs) workers={cfg.workers} threads={cfg.threads} "
-          f"sims={cfg.sims} batch={cfg.batch_size} nice={cfg.nice} | {cfg.duration_text()}", flush=True)
+          f"sims={cfg.sims} batch={cfg.batch_size} nice={cfg.nice} | {cfg.duration_text()} | {cfg.opponent_text()}",
+          flush=True)
     trainer = Trainer(cfg, control, ConsolePrinter(), resume=args.resume, run_name=args.name)
     reason = trainer.run()
     print(f"Run directory: {trainer.run_dir}")

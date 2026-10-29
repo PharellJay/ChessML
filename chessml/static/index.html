@@ -47,6 +47,22 @@
             </div>
             <p class="hint">Empty fields use the preset value.</p>
           </details>
+          <label>Mode
+            <select id="mode">
+              <option value="self" selected>Self-play</option>
+              <option value="engine">Self-play + games against Stockfish</option>
+            </select>
+          </label>
+          <fieldset id="engineFields" hidden>
+            <legend>Opponent</legend>
+            <div class="grid2">
+              <label>Games vs Stockfish % <input type="number" id="engineShare" min="1" max="100" value="50"></label>
+              <label>Starting level (0-20) <input type="number" id="engineLevel" min="0" max="20" value="0"></label>
+            </div>
+            <label class="toggle"><input type="checkbox" id="engineAdaptive" checked> Adapt the level to the network's results</label>
+            <label>Engine binary (optional) <input type="text" id="enginePath" placeholder="stockfish on PATH"></label>
+            <p class="hint" id="engineHint"></p>
+          </fieldset>
           <fieldset>
             <legend>Duration</legend>
             <label class="radio"><input type="radio" name="duration" value="stop" checked> Until I press Stop</label>
@@ -74,6 +90,7 @@
         <dl class="stats" id="statusList">
           <dt>Run</dt><dd id="st-run">–</dd>
           <dt>Preset</dt><dd id="st-preset">–</dd>
+          <dt>Opponent</dt><dd id="st-opponent">–</dd>
           <dt>Duration</dt><dd id="st-duration">–</dd>
           <dt>Elapsed</dt><dd id="st-elapsed">–</dd>
           <dt>ETA</dt><dd id="st-eta">–</dd>
@@ -95,7 +112,7 @@
 
     <div class="main-col">
       <div class="card live">
-        <h2>Live self-play game <span class="muted" id="liveInfo"></span></h2>
+        <h2>Live training game <span class="muted" id="liveInfo"></span></h2>
         <div class="live-grid">
           <div class="board-wrap"><div id="liveBoard" class="board"></div></div>
           <div class="live-side">
@@ -127,6 +144,8 @@
           <figure><figcaption>Average game length, last 100 games (plies)</figcaption><div id="chLen" class="chart"></div></figure>
           <figure><figcaption>Strength: Elo-style rating (random play = 0)</figcaption><div id="chElo" class="chart"></div></figure>
           <figure><figcaption>Evaluation score %</figcaption><div id="chScore" class="chart"></div></figure>
+          <figure><figcaption>Network's score vs Stockfish, last 50 engine games %</figcaption><div id="chEngScore" class="chart"></div></figure>
+          <figure><figcaption>Stockfish level (0-20)</figcaption><div id="chEngLevel" class="chart"></div></figure>
         </div>
         <details class="table-view">
           <summary>Evaluation table</summary>

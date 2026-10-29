@@ -4,6 +4,7 @@ import { BarChart, LineChart } from "/static/charts.js";
 const $id = (id) => document.getElementById(id);
 const PIECES = "/static/vendor/img/chesspieces/wikipedia/{piece}.png";
 const ROLLING = 100; // games in the outcome / length window
+const ENGINE_ROLLING = 50; // engine games in the score window
 
 const state = { info: null, status: { state: "idle" }, chartRun: null, games: [], evals: [] };
 
@@ -78,6 +79,10 @@ const charts = {
     emptyText: "No evaluation yet (runs every few minutes)" }),
   score: new LineChart($id("chScore"), { series: ["vs random", "vs material", "vs earlier checkpoint"], xLabel: "games", integerX: true,
     yMin: 0, yMax: 100, yFmt: pct, markers: true, emptyText: "No evaluation yet" }),
+  engScore: new LineChart($id("chEngScore"), { series: ["score"], xLabel: "game", integerX: true, yMin: 0, yMax: 100, yFmt: pct,
+    emptyText: "No games against Stockfish in this run" }),
+  engLevel: new LineChart($id("chEngLevel"), { series: ["level"], xLabel: "game", integerX: true, yMin: 0, yMax: 20,
+    yFmt: (v) => v.toFixed(0), emptyText: "No games against Stockfish in this run" }),
 };
 
 function outcomePoints(games) {
@@ -96,10 +101,27 @@ function outcomePoints(games) {
   return { w, d, b, len };
 }
 
+function engineGamePoints(games) {
+  const score = [], level = [];
+  const recent = [];
+  let total = 0;
+  for (const g of games) {
+    if (g.opponent !== "engine") continue;
+    recent.push(g.net_score); total += g.net_score;
+    if (recent.length > ENGINE_ROLLING) total -= recent.shift();
+    score.push([g.game, (100 * total) / recent.length]);
+    level.push([g.game, g.engine_level]);
+  }
+  return { score, level };
+}
+
 function renderOutcomes() {
   const { w, d, b, len } = outcomePoints(state.games);
   charts.wdl.set(0, w); charts.wdl.set(1, d); charts.wdl.set(2, b);
   charts.len.set(0, len);
+  const { score, level } = engineGamePoints(state.games);
+  charts.engScore.set(0, score);
+  charts.engLevel.set(0, level);
 }
 
 function opponentSlot(name) {
@@ -179,6 +201,13 @@ $id("chartRun").addEventListener("change", (e) => loadHistory(e.target.value));
 
 const ACTIVE = ["starting", "running", "paused", "stopping"];
 
+function opponentText(s) {
+  if (s.engine_share === undefined) return "–";
+  if (!s.engine_share) return "self-play";
+  const score = s.engine_score == null ? "" : ` · network ${(100 * s.engine_score).toFixed(0)}% at this level`;
+  return `${Math.round(100 * s.engine_share)}% vs Stockfish · level ${s.engine_level}${s.engine_adaptive ? " (adaptive)" : ""}${score}`;
+}
+
 function renderStatus(s) {
   const prevRun = state.status.run;
   state.status = s;
@@ -187,6 +216,7 @@ function renderStatus(s) {
   badge.className = `badge ${s.state}`;
   $id("st-run").textContent = s.run || "–";
   $id("st-preset").textContent = s.preset ? `${s.preset} (${s.workers ?? "?"} workers, ${s.threads ?? "?"} threads, ${s.sims ?? "?"} sims, nice ${s.nice ?? "?"})` : "–";
+  $id("st-opponent").textContent = opponentText(s);
   $id("st-duration").textContent = s.duration || "–";
   $id("st-elapsed").textContent = fmtDuration(s.elapsed);
   const showEta = ["running", "paused"].includes(s.state) && s.eta !== null && s.eta !== undefined;
@@ -216,6 +246,14 @@ function updatePresetHint() {
 }
 $id("preset").addEventListener("change", updatePresetHint);
 
+function updateEngineFields() {
+  $id("engineFields").hidden = $id("mode").value !== "engine";
+  if (!state.info) return;
+  $id("engineHint").textContent = state.info.engine ? `Found ${state.info.engine}` :
+    "Stockfish not found on PATH. Install it (sudo apt install stockfish) or enter the path of the binary.";
+}
+$id("mode").addEventListener("change", updateEngineFields);
+
 $id("trainForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   $id("trainError").textContent = "";
@@ -227,6 +265,12 @@ $id("trainForm").addEventListener("submit", async (e) => {
     games: num("games"), time: $id("time").value,
     resume: $id("resume").value || null, name: $id("runName").value || null,
   };
+  if ($id("mode").value === "engine") {
+    Object.assign(body, {
+      engine_share: (num("engineShare") ?? 50) / 100, engine_level: num("engineLevel"),
+      engine_adaptive: $id("engineAdaptive").checked, engine_path: $id("enginePath").value || null,
+    });
+  }
   try {
     renderStatus(await api("/api/training/start", body));
     log(`Starting ${body.preset} training…`);
@@ -247,7 +291,7 @@ function renderLive(ev) {
   liveBoard.position(ev.fen, false);
   const lm = ev.last_move;
   highlightSquares("liveBoard", "sq-last", lm ? [lm.slice(0, 2), lm.slice(2, 4)] : []);
-  $id("liveInfo").textContent = `ply ${ev.ply}, ${ev.turn} to move`;
+  $id("liveInfo").textContent = `${ev.opponent ? ev.opponent + " · " : ""}ply ${ev.ply}, ${ev.turn} to move`;
   setValueBar($id("liveBar"), $id("liveValue"), ev.value_white,
     `network ${signed(ev.value_white)} · after search ${signed(ev.search_white)} (−1 Black wins … +1 White wins)`);
   const share = Object.fromEntries((ev.top || []).map((m) => [m.uci, m.prob]));
@@ -496,6 +540,7 @@ async function init() {
   try {
     state.info = await api("/api/info");
     updatePresetHint();
+    updateEngineFields();
     renderStatus(state.info.status);
     renderLive(state.info.live);
   } catch (err) { log(`Server not reachable: ${err.message}`); }

@@ -99,6 +99,16 @@ class TrainConfig:
     dirichlet_alpha: float = 0.3
     dirichlet_eps: float = 0.25
 
+    # opponent: share of games played against a UCI engine (Stockfish) instead of self-play
+    engine_share: float = 0.0  # 0 = self-play only, 1 = engine games only
+    engine_path: str | None = None  # default: $CHESSML_ENGINE or stockfish on PATH
+    engine_time: float = 0.02  # seconds of engine search per move
+    engine_multipv: int = 5  # candidate moves per engine search (imitation target)
+    engine_level: int = 0  # strength 0-20: starting level, or the fixed level if not adaptive
+    engine_adaptive: bool = True  # move the level with the network's recent score
+    engine_window: int = 20  # engine games per adaptive decision
+    engine_imitate: bool = True  # also train on the engine's positions with its moves as target
+
     # optimisation
     lr: float = 1e-3
     weight_decay: float = 1e-4
@@ -134,3 +144,9 @@ class TrainConfig:
         if self.max_seconds:
             return f"{format_duration(self.max_seconds)} wall-clock"
         return "until stopped"
+
+    def opponent_text(self) -> str:
+        if self.engine_share <= 0:
+            return "self-play"
+        level = f"adaptive, from level {self.engine_level}" if self.engine_adaptive else f"level {self.engine_level}"
+        return f"{100 * self.engine_share:.0f}% vs Stockfish ({level})"

@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from .config import CPU_COUNT, TrainConfig, all_presets, parse_duration
+from .engine import check_engine_config, engine_available
 from .metrics import read_history
 from .runs import list_checkpoints, list_runs, resolve_checkpoint, resolve_run
 
@@ -154,12 +155,16 @@ class StartRequest(BaseModel):
     name: str | None = None
     eval_minutes: float | None = None
     checkpoint_minutes: float | None = None
+    engine_share: float | None = None  # 0 or empty = self-play only
+    engine_level: int | None = None
+    engine_adaptive: bool | None = None
+    engine_path: str | None = None
 
 
 @app.get("/api/info")
 def info():
     return {"cpu_count": CPU_COUNT, "presets": all_presets(), "defaults": TrainConfig().to_dict(),
-            "status": manager.status, "live": manager.live}
+            "engine": engine_available(), "status": manager.status, "live": manager.live}
 
 
 @app.post("/api/training/start")
@@ -176,12 +181,15 @@ def start_training(req: StartRequest):
             req.preset, workers=req.workers, threads=req.threads, sims=req.sims,
             batch_size=req.batch_size, nice=req.nice, max_games=max_games, max_seconds=max_seconds,
             eval_minutes=req.eval_minutes, checkpoint_minutes=req.checkpoint_minutes,
+            engine_share=req.engine_share, engine_level=req.engine_level, engine_adaptive=req.engine_adaptive,
+            engine_path=req.engine_path or None,
         )
         for field in ("workers", "threads", "sims", "batch_size"):
             if getattr(cfg, field) < 1:
                 raise ValueError(f"{field} must be at least 1")
         if not 0 <= cfg.nice <= 19:
             raise ValueError("niceness must be between 0 and 19")
+        check_engine_config(cfg)
         resume = req.resume or None
         if resume and not Path(resume).is_file():
             resume = str(resolve_run(resume))

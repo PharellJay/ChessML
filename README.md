@@ -12,6 +12,9 @@ watch it live, and play against any checkpoint.
   resume from any run or checkpoint.
 - **Intensity presets** (Light / Balanced / Heavy / Hardcore) that scale with
   your core count, plus manual overrides.
+- **Training against Stockfish** (optional): mix games against a local
+  Stockfish into self-play. The network learns from Stockfish's best moves,
+  and the engine's strength adapts to the network's results.
 - **Live dashboard** over WebSocket: losses, throughput, CPU per core, outcomes,
   game length, Elo-style strength, and the self-play game in progress with
   the network's move probabilities and value estimate.
@@ -141,6 +144,7 @@ python -m chessml train --preset heavy --games 2000      # game limit
 python -m chessml train --preset light                   # until Ctrl+C
 python -m chessml train --resume run-20261029-101500     # continue a run
 python -m chessml train --resume runs/x/checkpoints/ckpt_000500g.pt   # new run from a checkpoint
+python -m chessml train --preset heavy --engine-share 0.5 --time 1h   # half the games vs Stockfish
 python -m chessml evaluate run-20261029-101500 --games 40
 python -m chessml list                                   # presets, runs, checkpoints
 python -m chessml report --run run-20261029-101500       # regenerate Results below
@@ -186,6 +190,52 @@ processes that lower their own priority (niceness 5 to 19). The web server
 stays at normal priority and only relays events, so the kernel schedules it
 ahead of training even when every core is busy.
 
+### Training against Stockfish
+
+Self-play starts from nothing: an untrained network only learns from games
+between two equally clueless players. Games against an established engine
+give it a teacher. ChessML runs [Stockfish](https://stockfishchess.org/)
+locally rather than through an online API. The free chess APIs (Lichess's
+Stockfish AI via its Bot API, chess-api.com and the like) are rate-limited
+and play in real time, which means a few games a minute. Training needs
+thousands. A local Stockfish is the same engine, free, offline and as fast
+as the CPU allows.
+
+```bash
+sudo apt install stockfish        # Ubuntu/Debian; or download from stockfishchess.org
+python -m chessml train --preset heavy --engine-share 0.5 --time 1h
+```
+
+ChessML looks for the engine in `--engine-path`, then `$CHESSML_ENGINE`,
+then `stockfish` on the PATH (including `/usr/games/stockfish`). Any UCI
+engine that supports MultiPV works.
+
+- **The mix.** `--engine-share 0.5` makes each new game a game against
+  Stockfish with probability 50%. The rest stay self-play. `1` means engine
+  games only, `0` (the default) means pure self-play. In the UI, choose
+  *Mode: Self-play + games against Stockfish*. In an engine game the network
+  plays a random colour. Each worker starts its own single-threaded Stockfish
+  at the worker's niceness.
+- **What the network learns.** On the network's moves: the MCTS visit
+  counts, as in self-play. On Stockfish's moves: one multi-PV search
+  (`--engine-time`, 0.02 s by default) gives its 5 best moves. A softmax over
+  their scores becomes the policy target. Every position's value target is
+  the game result. The target is always Stockfish's *best* moves, not the
+  weakened move it plays, so the network never imitates a deliberate
+  mistake. `--no-imitate` trains on the network's own moves only.
+- **Strength levels 0-20.** Level 0 plays random moves. The share of
+  random moves falls to zero at level 10. Above that, Stockfish picks among
+  its candidates by a softmax over their scores, and the temperature falls
+  to zero at level 20, where it always plays its best move. The level is
+  ChessML's own scale, not Stockfish's `Skill Level`, and the top level is
+  still limited by the short search time.
+- **Adaptive level.** After every 20 engine games at the current level, a
+  score of 60% or more raises the level by one, and 30% or less lowers it.
+  `--engine-level N` sets the starting level, and `--engine-fixed` keeps it
+  there. The level is saved with each checkpoint, so `--resume` continues
+  from it. The dashboard charts the network's score against Stockfish and
+  the level game by game.
+
 ## UI tour
 
 **Train tab**
@@ -203,13 +253,14 @@ continue from 1,670 games.
 - *Status*: state, run, preset, elapsed time, ETA, games played, games/s,
   positions, network evaluations/s, training steps, replay buffer size and
   current checkpoint.
-- *Live self-play game*: the game worker 0 is playing, with the network's
-  value estimate (raw and after search) and its top moves (prior
-  probability, and share of search visits).
+- *Live training game*: the game worker 0 is playing (self-play or against
+  Stockfish), with the network's value estimate (raw and after search) and
+  its top moves (prior probability, and share of search visits).
 - *Metrics*: charts for loss (policy, value, total), games/s, overall CPU,
   CPU per core, win/draw/loss and average game length over the last 100
-  games, Elo-style rating per evaluated checkpoint, and evaluation scores,
-  plus an evaluation table. The **Run** selector shows the history of any
+  games, Elo-style rating per evaluated checkpoint, evaluation scores, and,
+  for runs with engine games, the network's score against Stockfish and the
+  Stockfish level, plus an evaluation table. The **Run** selector shows the history of any
   past run: metrics are stored per run in SQLite (`runs/<run>/metrics.db`),
   so charts survive restarts.
 
@@ -320,8 +371,9 @@ chessml/
   encoding.py    board planes, move <-> policy index (4,672 AlphaZero move slots)
   network.py     residual policy/value network, checkpoint save/load
   mcts.py        batched PUCT search with tree reuse
-  selfplay.py    self-play worker processes, game rules, adjudication
+  selfplay.py    self-play worker processes (and engine games), game rules, adjudication
   trainer.py     replay buffer, optimisation, checkpoints, evaluation, graceful stop
+  engine.py      Stockfish (UCI) opponent: strength levels, imitation targets, adaptive level
   evaluation.py  random and material-capture baselines, matches, Elo fitting
   metrics.py     per-run SQLite metrics
   runs.py        run directories and checkpoint discovery

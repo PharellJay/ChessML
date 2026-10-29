@@ -3,7 +3,8 @@ checkpoints, periodic evaluation and graceful stop.
 
 Processes (all started with the "spawn" method):
     trainer       this module; owns the network, optimiser and replay buffer
-    workers x N   self-play (selfplay.worker_main), one core each
+    workers x N   self-play (selfplay.worker_main), one core each; with an
+                  engine share, each also drives its own Stockfish process
     evaluator     occasional strength test of the newest checkpoint
 The controller (CLI or web server) talks to the trainer through `Control`
 (pause/stop events) and receives events through the `emit` callback.
@@ -26,6 +27,7 @@ import torch.nn.functional as F
 
 from .config import TrainConfig, apply_niceness
 from .encoding import NUM_PLANES, POLICY_SIZE, planes_to_float
+from .engine import EngineLadder, find_engine
 from .evaluation import compute_ratings, eval_process_main
 from .metrics import MetricsDB
 from .network import ChessNet, NetConfig, load_checkpoint, save_checkpoint
@@ -126,9 +128,14 @@ class Trainer:
         else:
             self.run_dir = new_run_dir(self.run_name)
 
+        if cfg.engine_share > 0:
+            cfg.engine_path = find_engine(cfg.engine_path)
         data = load_checkpoint(str(ckpt_path)) if ckpt_path else None
         if data:
             cfg.blocks, cfg.channels = data["net"]["blocks"], data["net"]["channels"]
+            if cfg.engine_adaptive and data.get("engine_level") is not None:
+                cfg.engine_level = data["engine_level"]  # the ladder continues where it was
+        self.ladder = EngineLadder(cfg.engine_level, cfg.engine_adaptive, cfg.engine_window)
         self.model = ChessNet(NetConfig(cfg.blocks, cfg.channels))
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
         self.games = self.steps = self.positions = 0
@@ -169,6 +176,7 @@ class Trainer:
         self.weights_path = self.run_dir / "weights.pt"
         save_checkpoint(str(self.weights_path), self.model)
         self.version = ctx.Value("i", 0)
+        self.engine_level = ctx.Value("i", self.ladder.level)
         self.counters = ctx.Array("q", cfg.workers)
         self.game_queue = ctx.Queue()
         self.live_queue = ctx.Queue(maxsize=8)
@@ -185,7 +193,7 @@ class Trainer:
         self.workers = [
             ctx.Process(
                 target=worker_main, daemon=True, name=f"chessml-selfplay-{i}",
-                args=(i, cfg.to_dict(), str(self.weights_path), self.version, self.counters,
+                args=(i, cfg.to_dict(), str(self.weights_path), self.version, self.engine_level, self.counters,
                       self.game_queue, self.live_queue, self.control.pause, self.worker_stop, seed + i),
             )
             for i in range(cfg.workers)
@@ -202,9 +210,10 @@ class Trainer:
         self.last_rates = (time.time(), self.positions, 0)
         self.rates = {"games_per_sec": 0.0, "positions_per_sec": 0.0, "evals_per_sec": 0.0}
         self.db.insert("sessions", {"elapsed": self.elapsed_base, "event": "start",
-                                    "detail": f"preset={cfg.preset} workers={cfg.workers} {cfg.duration_text()}"})
+                                    "detail": f"preset={cfg.preset} workers={cfg.workers} {cfg.duration_text()}"
+                                              + ("" if cfg.engine_share <= 0 else f", {cfg.opponent_text()}")})
         self.emit({"type": "log", "message": f"Run {self.run_dir.name} started: {cfg.preset} preset, "
-                                            f"{cfg.workers} workers, {cfg.duration_text()}"})
+                                            f"{cfg.workers} workers, {cfg.duration_text()}, {cfg.opponent_text()}"})
 
         now = time.time()
         last_tick = last_status = last_ckpt = last_eval = now
@@ -278,9 +287,21 @@ class Trainer:
         self.session_positions += n
         self.recent_games.append(time.time())
         row = {"elapsed": self._elapsed(), "game": self.games, "result": msg["result"],
-               "plies": msg["plies"], "termination": msg["termination"], "worker": msg["worker"]}
+               "plies": msg["plies"], "termination": msg["termination"], "worker": msg["worker"],
+               "opponent": msg["opponent"], "engine_level": msg["engine_level"], "net_score": msg["net_score"]}
         self.db.insert("games", row)
         self.emit({"type": "game", **row})
+        if msg["opponent"] == "engine":
+            self._update_engine_level(msg["net_score"], msg["engine_level"])
+
+    def _update_engine_level(self, net_score: float, level: int) -> None:
+        new = self.ladder.record(net_score, level)
+        if new is None:
+            return
+        self.engine_level.value = new
+        self.emit({"type": "log", "message": f"Stockfish level {'raised' if new > level else 'lowered'} to {new}: "
+                                            f"the network scored {100 * self.ladder.decided_score:.0f}% over its "
+                                            f"last {self.ladder.window} games at level {level}"})
 
     def _drain_live(self) -> None:
         latest = None
@@ -355,7 +376,7 @@ class Trainer:
         self.model.eval()
         save_checkpoint(str(path), self.model, self.optimizer, games=self.games, steps=self.steps,
                         positions=self.positions, elapsed=self._elapsed(), run=self.run_dir.name,
-                        config=self.cfg.to_dict(), created=time.time())
+                        config=self.cfg.to_dict(), created=time.time(), engine_level=self.ladder.level)
         self.checkpoint = str(path)
         self._write_state("running")
         self.emit({"type": "checkpoint", "path": str(path), "name": path.name, "games": self.games})
@@ -365,7 +386,7 @@ class Trainer:
         write_json(self.run_dir / "state.json", {
             "status": status, "games": self.games, "steps": self.steps, "positions": self.positions,
             "elapsed": self._elapsed(), "checkpoint": self.checkpoint, "preset": self.cfg.preset,
-            "updated": time.time(),
+            "engine_level": self.ladder.level if self.cfg.engine_share > 0 else None, "updated": time.time(),
         })
 
     def _start_eval(self) -> None:
@@ -481,7 +502,9 @@ class Trainer:
             "eta": self._eta(), "games": self.games, "session_games": self.session_games,
             "positions": self.positions, "steps": self.steps, "buffer": self.buffer.size,
             "checkpoint": Path(self.checkpoint).name if self.checkpoint else None,
-            "evaluating": self.eval_proc is not None, **self.rates,
+            "evaluating": self.eval_proc is not None, "opponent": cfg.opponent_text(),
+            "engine_share": cfg.engine_share, "engine_level": self.ladder.level, "engine_score": self.ladder.score(),
+            "engine_window": cfg.engine_window, **self.rates,
         })
 
     # -- shutdown ---------------------------------------------------------

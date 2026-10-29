@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS train (
     policy_loss REAL, value_loss REAL, total_loss REAL, lr REAL);
 CREATE TABLE IF NOT EXISTS games (
     ts REAL, elapsed REAL, game INTEGER, result TEXT, plies INTEGER,
-    termination TEXT, worker INTEGER);
+    termination TEXT, worker INTEGER, opponent TEXT, engine_level INTEGER, net_score REAL);
 CREATE TABLE IF NOT EXISTS system (
     ts REAL, elapsed REAL, games INTEGER, games_per_sec REAL, positions_per_sec REAL,
     evals_per_sec REAL, cpu_total REAL, cpu_per_core TEXT, mem_percent REAL);
@@ -33,12 +33,18 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 TABLE_COLUMNS = {
     "train": ("ts", "elapsed", "step", "games", "policy_loss", "value_loss", "total_loss", "lr"),
-    "games": ("ts", "elapsed", "game", "result", "plies", "termination", "worker"),
+    "games": ("ts", "elapsed", "game", "result", "plies", "termination", "worker",
+              "opponent", "engine_level", "net_score"),
     "system": ("ts", "elapsed", "games", "games_per_sec", "positions_per_sec", "evals_per_sec",
                "cpu_total", "cpu_per_core", "mem_percent"),
     "evals": ("ts", "elapsed", "games", "step", "checkpoint", "opponent", "wins", "draws", "losses", "sims"),
     "ratings": ("ts", "elapsed", "games", "step", "checkpoint", "rating", "material_rating"),
     "sessions": ("ts", "elapsed", "event", "detail"),
+}
+
+# columns added after the first release, so older run databases get them on open
+ADDED_COLUMNS = {
+    "games": {"opponent": "TEXT", "engine_level": "INTEGER", "net_score": "REAL"},
 }
 
 
@@ -48,6 +54,11 @@ class MetricsDB:
         self.conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        for table, columns in ADDED_COLUMNS.items():
+            existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, kind in columns.items():
+                if name not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
         self.conn.commit()
 
     def insert(self, table: str, row: dict) -> None:

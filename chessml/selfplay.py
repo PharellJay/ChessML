@@ -1,4 +1,5 @@
-"""Self-play worker processes and the game rules shared with evaluation."""
+"""Self-play worker processes (including games against an engine) and the game
+rules shared with evaluation."""
 
 from __future__ import annotations
 
@@ -9,6 +10,8 @@ from collections import Counter
 
 import chess
 import numpy as np
+
+from .encoding import NUM_PLANES
 
 PIECE_VALUES = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0}
 
@@ -62,7 +65,7 @@ def result_value(result: str, turn: chess.Color) -> float:
 
 
 class _Game:
-    def __init__(self):
+    def __init__(self, engine_color: chess.Color | None = None, engine_level: int = 0):
         from .mcts import SearchTree
 
         self.tree = SearchTree()
@@ -71,6 +74,17 @@ class _Game:
         self.pol_p: list[np.ndarray] = []
         self.turns: list[bool] = []
         self.moves: list[str] = []
+        self.engine_color = engine_color  # None for a self-play game
+        self.engine_level = engine_level
+
+    def engine_to_move(self) -> bool:
+        return self.engine_color is not None and self.tree.board.turn == self.engine_color
+
+    def opponent_label(self) -> str:
+        if self.engine_color is None:
+            return "self-play"
+        net = "White" if self.engine_color == chess.BLACK else "Black"
+        return f"vs Stockfish level {self.engine_level} (network plays {net})"
 
 
 def _ignore_sigint_and_nice(nice: int) -> None:
@@ -81,9 +95,13 @@ def _ignore_sigint_and_nice(nice: int) -> None:
     apply_niceness(nice)
 
 
-def worker_main(worker_id, cfg_dict, weights_path, weights_version, counters,
+def worker_main(worker_id, cfg_dict, weights_path, weights_version, engine_level, counters,
                 game_queue, live_queue, pause_event, stop_event, seed):
-    """Play self-play games until `stop_event` is set; unfinished games are discarded."""
+    """Play games until `stop_event` is set; unfinished games are discarded.
+
+    A share `engine_share` of the games is played against the UCI engine at
+    the level the trainer publishes in `engine_level`.
+    """
     from .config import TrainConfig
     from .encoding import encode_board
     from .mcts import MCTS
@@ -102,57 +120,98 @@ def worker_main(worker_id, cfg_dict, weights_path, weights_version, counters,
     loaded_version = -1
     mcts = MCTS(Evaluator(model), c_puct=cfg.c_puct, dirichlet_alpha=cfg.dirichlet_alpha,
                 dirichlet_eps=cfg.dirichlet_eps, rng=rng)
-    games = [_Game() for _ in range(cfg.parallel_games)]
+    engine = None
+
+    def new_game() -> _Game:
+        if cfg.engine_share > 0 and rng.random() < cfg.engine_share:
+            return _Game(chess.WHITE if rng.random() < 0.5 else chess.BLACK, engine_level.value)
+        return _Game()
+
+    games = [new_game() for _ in range(cfg.parallel_games)]
     last_live = 0.0
 
-    while not stop_event.is_set():
-        if pause_event.is_set():
-            time.sleep(0.1)
-            continue
-        if weights_version.value != loaded_version:
-            loaded_version = weights_version.value
-            model.load_state_dict(load_checkpoint(weights_path)["model"])
-            model.eval()
-
-        evals_before = mcts.leaf_evals
-        mcts.run([g.tree for g in games], cfg.sims, add_noise=True)
-        counters[worker_id] += mcts.leaf_evals - evals_before
-
-        if worker_id == 0 and time.time() - last_live > 0.25:
-            last_live = time.time()
-            _send_live(live_queue, games[0])
-
-        for slot, game in enumerate(games):
-            if stop_event.is_set():
-                break
-            tree = game.tree
-            board = tree.board
-            moves, probs = tree.visit_distribution()
-            game.planes.append(encode_board(board, repetition=tree.is_repetition()))
-            game.pol_idx.append(tree.root.indices.astype(np.int16))
-            game.pol_p.append(probs.astype(np.float32))
-            game.turns.append(board.turn)
-            temperature = 1.0 if board.ply() < cfg.temperature_plies else 0.0
-            move = mcts.choose_move(tree, temperature)
-            game.moves.append(move.uci())
-            tree.advance(move)
-            status = game_status(tree.board, tree.history, cfg.max_plies, cfg.adjudicate_material)
-            if status is None:
+    try:
+        while not stop_event.is_set():
+            if pause_event.is_set():
+                time.sleep(0.1)
                 continue
-            result, termination = status
-            z = np.array([result_value(result, t) for t in game.turns], dtype=np.float32)
-            game_queue.put({
-                "worker": worker_id,
-                "planes": np.stack(game.planes),
-                "pol_idx": game.pol_idx,
-                "pol_p": game.pol_p,
-                "z": z,
-                "result": result,
-                "termination": termination,
-                "plies": len(game.moves),
-                "moves": game.moves,
-            })
-            games[slot] = _Game()
+            if weights_version.value != loaded_version:
+                loaded_version = weights_version.value
+                model.load_state_dict(load_checkpoint(weights_path)["model"])
+                model.eval()
+
+            evals_before = mcts.leaf_evals
+            mcts.run([g.tree for g in games if not g.engine_to_move()], cfg.sims, add_noise=True)
+            counters[worker_id] += mcts.leaf_evals - evals_before
+
+            if worker_id == 0 and time.time() - last_live > 0.25:
+                last_live = time.time()
+                _send_live(live_queue, games[0])
+
+            for slot, game in enumerate(games):
+                if stop_event.is_set():
+                    break
+                tree = game.tree
+                board = tree.board
+                if game.engine_to_move():
+                    if engine is None:
+                        from .engine import open_engine
+
+                        engine = open_engine(cfg.engine_path)
+                    move = _engine_move(engine, game, cfg, rng)
+                else:
+                    moves, probs = tree.visit_distribution()
+                    game.planes.append(encode_board(board, repetition=tree.is_repetition()))
+                    game.pol_idx.append(tree.root.indices.astype(np.int16))
+                    game.pol_p.append(probs.astype(np.float32))
+                    game.turns.append(board.turn)
+                    temperature = 1.0 if board.ply() < cfg.temperature_plies else 0.0
+                    move = mcts.choose_move(tree, temperature)
+                game.moves.append(move.uci())
+                tree.advance(move)
+                status = game_status(tree.board, tree.history, cfg.max_plies, cfg.adjudicate_material)
+                if status is None:
+                    continue
+                result, termination = status
+                z = np.array([result_value(result, t) for t in game.turns], dtype=np.float32)
+                net_score = None
+                if game.engine_color is not None:
+                    net_score = (result_value(result, not game.engine_color) + 1) / 2
+                game_queue.put({
+                    "worker": worker_id,
+                    "planes": np.stack(game.planes) if game.planes else np.zeros((0, NUM_PLANES, 8, 8), np.uint8),
+                    "pol_idx": game.pol_idx,
+                    "pol_p": game.pol_p,
+                    "z": z,
+                    "result": result,
+                    "termination": termination,
+                    "plies": len(game.moves),
+                    "moves": game.moves,
+                    "opponent": "self" if game.engine_color is None else "engine",
+                    "engine_level": None if game.engine_color is None else game.engine_level,
+                    "net_score": net_score,
+                })
+                games[slot] = new_game()
+    finally:
+        if engine is not None:
+            engine.quit()
+
+
+def _engine_move(engine, game: _Game, cfg, rng: np.random.Generator) -> chess.Move:
+    """The engine's move; with imitation on, its position is recorded with its best moves as target."""
+    from .encoding import encode_board
+    from .engine import analyse, choose_engine_move, policy_target
+
+    tree = game.tree
+    board = tree.board
+    scored = analyse(engine, board, cfg.engine_time, cfg.engine_multipv)
+    if cfg.engine_imitate and scored:
+        idx, p = policy_target(scored, board.turn)
+        game.planes.append(encode_board(board, repetition=tree.is_repetition()))
+        game.pol_idx.append(idx)
+        game.pol_p.append(p)
+        game.turns.append(board.turn)
+    return choose_engine_move(scored, board, game.engine_level, rng)
 
 
 def _send_live(live_queue, game: _Game) -> None:
@@ -170,6 +229,7 @@ def _send_live(live_queue, game: _Game) -> None:
         "ply": board.ply(),
         "last_move": board.peek().uci() if board.move_stack else None,
         "turn": "white" if board.turn == chess.WHITE else "black",
+        "opponent": game.opponent_label(),
         "value_white": sign * root.value,  # raw network value
         "search_white": sign * root.q(),  # value after search
         "top": top,

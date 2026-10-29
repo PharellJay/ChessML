@@ -208,6 +208,13 @@ def results_markdown(run_dir: Path, h: dict, charts, image_dir: str, hardware: d
         lines.append(f"| Last {n} self-play games | " + ", ".join(f"{k} {v}" for k, v in
                                                                    sorted(term.items(), key=lambda kv: -kv[1]))
                      + f"; average length {sum(g['plies'] for g in tail) / n:.0f} plies |")
+        engine = [g for g in h["games"] if g.get("opponent") == "engine"]
+        if engine:
+            last = engine[-50:]
+            score = 100 * sum(g["net_score"] for g in last) / len(last)
+            lines.append(f"| Games against Stockfish | {100 * len(engine) / len(h['games']):.0f}% of games; level "
+                         f"{engine[0]['engine_level']} -> {engine[-1]['engine_level']}; network score over the "
+                         f"last {len(last)}: {score:.0f}% |")
     if hardware_note:
         lines += ["", hardware_note]
     lines.append("")

@@ -96,8 +96,7 @@ watch it live, and play against any checkpoint.
 
 ## Install
 
-Requires Python 3.14 (also tested in a 3.14.6 virtual environment) and works
-on CPU only.
+Developed and tested with Python 3.14.6 on Linux. No GPU is needed.
 
 ```bash
 git clone https://github.com/PharellJay/ChessML.git

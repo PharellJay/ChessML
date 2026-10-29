@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import random
+import re
 import signal
 from collections import Counter
 from pathlib import Path
@@ -169,6 +170,22 @@ def compute_ratings(matches: list[tuple[str, str, int, int, int]], anchor: str =
             if curvature > 0:
                 ratings[p] += max(-400.0, min(400.0, residual / curvature))
     return ratings
+
+
+def checkpoint_ratings(evals: list[dict]) -> dict:
+    """One rating fit over all evaluation records of a run.
+
+    Returns the evaluated checkpoints ordered by self-play games (parsed from
+    the ckpt_<games>g.pt name) and the material baseline's rating.
+    """
+    ratings = compute_ratings([(e["checkpoint"], e["opponent"], e["wins"], e["draws"], e["losses"]) for e in evals])
+    points = []
+    for name, rating in ratings.items():
+        m = re.match(r"ckpt_(\d+)g\.pt$", name)
+        if m:
+            points.append({"checkpoint": name, "games": int(m.group(1)), "rating": rating})
+    points.sort(key=lambda p: p["games"])
+    return {"checkpoints": points, "material": ratings.get("material"), "all": ratings}
 
 
 def evaluate_checkpoint(checkpoint: str, opponents: list[str], games: int, sims: int,

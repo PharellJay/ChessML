@@ -144,8 +144,12 @@ async function loadHistory(name) {
   if (h.system.length) charts.cores.set(h.system[h.system.length - 1].cpu_per_core);
   state.games = h.games;
   renderOutcomes();
-  charts.elo.set(0, h.ratings.map((r) => [r.games, r.rating]));
-  charts.elo.set(1, h.ratings.map((r) => [r.games, r.material_rating]));
+  // one rating fit over all evaluation games of the run (same as the README)
+  const fit = h.fitted.checkpoints;
+  charts.elo.set(0, fit.map((p) => [p.games, p.rating]));
+  const xs = fit.map((p) => p.games);
+  charts.elo.set(1, h.fitted.material === null || !xs.length ? []
+    : [[Math.min(...xs), h.fitted.material], [Math.max(...xs), h.fitted.material]]);
   state.evals = h.evals;
   renderEvals();
 }
@@ -285,13 +289,7 @@ function handleEvent(ev) {
       renderOutcomes();
       break;
     case "eval":
-      if (!sameRun) break;
-      charts.elo.push(0, [ev.games, ev.rating]);
-      charts.elo.push(1, [ev.games, ev.material_rating]);
-      for (const r of ev.records) {
-        state.evals.push({ games: ev.games, checkpoint: r.player, opponent: r.opponent, wins: r.wins, draws: r.draws, losses: r.losses });
-      }
-      renderEvals();
+      if (sameRun) loadHistory(state.chartRun);  // ratings are refitted over all evaluations
       break;
   }
 }

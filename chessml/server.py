@@ -223,10 +223,15 @@ def runs():
 
 @app.get("/api/runs/{name}/history")
 def run_history(name: str, limit: int = 2000):
+    from .evaluation import checkpoint_ratings
+
     try:
-        return read_history(resolve_run(name), limit)
+        history = read_history(resolve_run(name), limit)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc))
+    fit = checkpoint_ratings(history["evals"])
+    history["fitted"] = {"checkpoints": fit["checkpoints"], "material": fit["material"]}
+    return history
 
 
 @app.get("/api/checkpoints")

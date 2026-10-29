@@ -136,7 +136,7 @@ def cmd_evaluate(args) -> int:
     print(f"{'player':<22} {'opponent':<22} {'W':>4} {'D':>4} {'L':>4} {'score':>6}  terminations")
     for r in records:
         print(f"{r['player']:<22} {r['opponent']:<22} {r['wins']:>4} {r['draws']:>4} {r['losses']:>4} "
-              f"{score(r):>6.2f}  {r['terminations']}")
+              f"{100 * score(r):>5.1f}%  {r['terminations']}")
     print(f"({time.time() - start:.0f}s)")
     if db:
         meta = load_checkpoint(str(ckpt))

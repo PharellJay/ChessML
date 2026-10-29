@@ -18,7 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from .config import format_duration  # noqa: E402
-from .evaluation import compute_ratings  # noqa: E402
+from .evaluation import checkpoint_ratings, compute_ratings  # noqa: E402
 from .metrics import read_history  # noqa: E402
 from .runs import MODELS_DIR, list_runs, read_json, resolve_run  # noqa: E402
 
@@ -135,15 +135,16 @@ def make_charts(h: dict, out_dir: Path) -> list[tuple[str, str]]:
         _save(fig, out_dir / "game_length.png")
         charts.append(("game_length.png", "Average self-play game length"))
 
-    if h["ratings"]:
+    if h["evals"]:
+        # final fit over all evaluation games, so the chart matches the ratings table
+        fit = checkpoint_ratings(h["evals"])
         fig, ax = plt.subplots(figsize=(6.4, 3.4))
-        xs = [r["games"] for r in h["ratings"]]
-        ax.plot(xs, [r["rating"] for r in h["ratings"]], color=COLORS[0], lw=2, marker="o", label="checkpoint")
-        mat = [r["material_rating"] for r in h["ratings"] if r["material_rating"] is not None]
-        if mat:
-            ax.axhline(mat[-1], color=COLORS[1], lw=2, ls="--", label="material-capture baseline")
+        ax.plot([p["games"] for p in fit["checkpoints"]], [p["rating"] for p in fit["checkpoints"]],
+                color=COLORS[0], lw=2, marker="o", label="checkpoint")
+        if fit["material"] is not None:
+            ax.axhline(fit["material"], color=COLORS[1], lw=2, ls="--", label="material-capture baseline")
         ax.axhline(0, color=COLORS[2], lw=2, ls=":", label="random play (anchor)")
-        _style(ax, "Strength during training (Elo-style, random = 0)", "self-play games", "rating")
+        _style(ax, "Strength of checkpoints (Elo-style, random = 0)", "self-play games", "rating")
         ax.legend(frameon=False)
         _save(fig, out_dir / "strength.png")
         charts.append(("strength.png", "Elo-style rating of checkpoints during training"))
@@ -164,7 +165,8 @@ def _final_evals(evals: list[dict]) -> tuple[str | None, list[dict]]:
     return last, list(latest.values())
 
 
-def results_markdown(run_dir: Path, h: dict, charts, image_dir: str, hardware: dict, hardware_note: str) -> str:
+def results_markdown(run_dir: Path, h: dict, charts, image_dir: str, hardware: dict, hardware_note: str,
+                     exported: dict | None = None) -> str:
     cfg = read_json(run_dir / "config.json", {}) or {}
     state = read_json(run_dir / "state.json", {}) or {}
     sessions = h["sessions"]
@@ -218,7 +220,7 @@ def results_markdown(run_dir: Path, h: dict, charts, image_dir: str, hardware: d
         for e in final:
             n = e["wins"] + e["draws"] + e["losses"]
             lines.append(f"| {e['opponent']} | {n} | {e['wins']} | {e['draws']} | {e['losses']} | "
-                         f"{100 * (e['wins'] + e['draws'] / 2) / n:.0f}% |")
+                         f"{100 * (e['wins'] + e['draws'] / 2) / n:.1f}% |")
         sims = {e["sims"] for e in final if e["sims"]}
         lines.append("")
         lines.append(f"Simulations per move in evaluation: {', '.join(map(str, sorted(sims))) or 'n/a'}.")
@@ -228,6 +230,10 @@ def results_markdown(run_dir: Path, h: dict, charts, image_dir: str, hardware: d
         for name, rating in sorted(ratings.items(), key=lambda kv: kv[1], reverse=True):
             lines.append(f"| {name} | {rating:.0f} |")
         lines.append("")
+        if exported:
+            lines += [f"The bundled `models/best.pt` is `{exported['source']}`, the best-rated checkpoint "
+                      f"({exported['rating']:.0f}), saved without optimiser state "
+                      f"({exported['size_mb']:.1f} MB).", ""]
     else:
         lines += ["No evaluations recorded for this run yet.", ""]
 
@@ -240,7 +246,7 @@ def results_markdown(run_dir: Path, h: dict, charts, image_dir: str, hardware: d
     return "\n".join(lines)
 
 
-def export_best_checkpoint(run_dir: Path, h: dict) -> Path | None:
+def export_best_checkpoint(run_dir: Path, h: dict) -> dict | None:
     """Copy the best-rated checkpoint (weights only) to models/best.pt."""
     from .network import load_checkpoint, model_from_checkpoint, save_checkpoint
 
@@ -256,7 +262,7 @@ def export_best_checkpoint(run_dir: Path, h: dict) -> Path | None:
     dest = MODELS_DIR / "best.pt"
     save_checkpoint(str(dest), model_from_checkpoint(data), games=data.get("games"), steps=data.get("steps"),
                     elapsed=data.get("elapsed"), run=run_dir.name, source=name, rating=rating)
-    return dest
+    return {"path": dest, "source": name, "rating": rating, "size_mb": dest.stat().st_size / 1e6}
 
 
 def generate_report(run: str | None, readme: Path, out_dir: Path, export_best: bool = False) -> None:
@@ -273,12 +279,13 @@ def generate_report(run: str | None, readme: Path, out_dir: Path, export_best: b
     if not hardware:
         hardware = machine_info()
         note = "_Hardware details describe the machine that generated this report (the run did not record its own)._"
+    exported = export_best_checkpoint(run_dir, h) if export_best else None
     charts = make_charts(h, out_dir)
     try:
         image_dir = out_dir.resolve().relative_to(readme.resolve().parent).as_posix()
     except ValueError:
         image_dir = out_dir.as_posix()
-    section = results_markdown(run_dir, h, charts, image_dir, hardware, note)
+    section = results_markdown(run_dir, h, charts, image_dir, hardware, note, exported)
     text = readme.read_text() if readme.exists() else f"# ChessML\n\n## Results\n\n{START}\n{END}\n"
     if START in text and END in text:
         text = re.sub(re.escape(START) + r".*?" + re.escape(END), lambda _: section, text, flags=re.S)
@@ -286,9 +293,7 @@ def generate_report(run: str | None, readme: Path, out_dir: Path, export_best: b
         text = text.rstrip() + "\n\n## Results\n\n" + section + "\n"
     readme.write_text(text)
     print(f"Updated {readme} from run {run_dir.name}; charts in {out_dir}")
-    if export_best:
-        dest = export_best_checkpoint(run_dir, h)
-        if dest:
-            print(f"Exported best checkpoint to {dest} ({dest.stat().st_size / 1e6:.1f} MB)")
-        else:
-            print("No rated checkpoint to export")
+    if exported:
+        print(f"Exported {exported['source']} to {exported['path']} ({exported['size_mb']:.1f} MB)")
+    elif export_best:
+        print("No rated checkpoint to export")

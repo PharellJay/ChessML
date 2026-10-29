@@ -148,6 +148,9 @@ class Trainer:
             self.checkpoint = str(ckpt_path)
         self.db = MetricsDB(self.run_dir / "metrics.db")
         write_json(self.run_dir / "config.json", cfg.to_dict())
+        from .report import machine_info
+
+        write_json(self.run_dir / "hardware.json", machine_info())
         evals = self.db.fetch("evals")
         self.last_evaluated = next((e["checkpoint"] for e in reversed(evals) if e["checkpoint"] != "material"), None)
         self.have_material_reference = any(e["checkpoint"] == "material" for e in evals)

@@ -5,6 +5,7 @@ chess==1.11.2
 numpy==2.5.4
 fastapi==0.162.0
 uvicorn==0.54.0
+websockets==17.3  # WebSocket support for uvicorn
 psutil==7.2.2
 matplotlib==3.11.2
 pytest==9.2.0

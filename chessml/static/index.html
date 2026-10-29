@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChessML</title>
+  <link rel="stylesheet" href="/static/vendor/chessboard-1.0.0.min.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/vendor/jquery-3.7.1.min.js"></script>
+  <script src="/static/vendor/chessboard-1.0.0.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <h1>ChessML</h1>
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="train" role="tab">Train</button>
+    <button class="tab" data-tab="play" role="tab">Play</button>
+  </nav>
+  <span id="conn" class="conn" title="Live connection">connecting…</span>
+</header>
+
+<main>
+<!-- ============================== TRAIN ============================== -->
+<section id="tab-train" class="tab-panel active">
+  <div class="train-grid">
+    <aside class="side">
+      <div class="card">
+        <h2>Training</h2>
+        <form id="trainForm" autocomplete="off">
+          <label>Intensity preset
+            <select id="preset">
+              <option value="light">Light</option>
+              <option value="balanced" selected>Balanced</option>
+              <option value="heavy">Heavy</option>
+              <option value="hardcore">Hardcore</option>
+            </select>
+          </label>
+          <p class="hint" id="presetHint"></p>
+          <details>
+            <summary>Manual overrides</summary>
+            <div class="grid2">
+              <label>Workers <input type="number" id="workers" min="1" max="256"></label>
+              <label>Torch threads <input type="number" id="threads" min="1" max="256"></label>
+              <label>Simulations / move <input type="number" id="sims" min="1" max="5000"></label>
+              <label>Batch size <input type="number" id="batch_size" min="1" max="8192"></label>
+              <label>Niceness <input type="number" id="nice" min="0" max="19"></label>
+            </div>
+            <p class="hint">Empty fields use the preset value.</p>
+          </details>
+          <fieldset>
+            <legend>Duration</legend>
+            <label class="radio"><input type="radio" name="duration" value="stop" checked> Until I press Stop</label>
+            <label class="radio"><input type="radio" name="duration" value="games"> Games
+              <input type="number" id="games" min="1" value="500" class="inline"></label>
+            <label class="radio"><input type="radio" name="duration" value="time"> Time
+              <input type="text" id="time" value="2h" class="inline" placeholder="2h, 90m"></label>
+          </fieldset>
+          <label>Start from
+            <select id="resume"><option value="">New run</option></select>
+          </label>
+          <label>Run name (new runs, optional) <input type="text" id="runName" placeholder="auto"></label>
+          <div class="buttons">
+            <button type="submit" id="btnStart" class="primary">Start</button>
+            <button type="button" id="btnPause">Pause</button>
+            <button type="button" id="btnResume">Resume</button>
+            <button type="button" id="btnStop" class="danger">Stop</button>
+          </div>
+          <p class="error" id="trainError" role="alert"></p>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Status <span id="stateBadge" class="badge">idle</span></h2>
+        <dl class="stats" id="statusList">
+          <dt>Run</dt><dd id="st-run">–</dd>
+          <dt>Preset</dt><dd id="st-preset">–</dd>
+          <dt>Duration</dt><dd id="st-duration">–</dd>
+          <dt>Elapsed</dt><dd id="st-elapsed">–</dd>
+          <dt>ETA</dt><dd id="st-eta">–</dd>
+          <dt>Games played</dt><dd id="st-games">–</dd>
+          <dt>Games / sec</dt><dd id="st-gps">–</dd>
+          <dt>Positions</dt><dd id="st-positions">–</dd>
+          <dt>Net evals / sec</dt><dd id="st-eps">–</dd>
+          <dt>Training steps</dt><dd id="st-steps">–</dd>
+          <dt>Replay buffer</dt><dd id="st-buffer">–</dd>
+          <dt>Checkpoint</dt><dd id="st-ckpt">–</dd>
+        </dl>
+      </div>
+
+      <div class="card">
+        <h2>Log</h2>
+        <ol id="log" class="log"><li class="placeholder">Training messages appear here while this page is open.</li></ol>
+      </div>
+    </aside>
+
+    <div class="main-col">
+      <div class="card live">
+        <h2>Live self-play game <span class="muted" id="liveInfo"></span></h2>
+        <div class="live-grid">
+          <div class="board-wrap"><div id="liveBoard" class="board"></div></div>
+          <div class="live-side">
+            <div class="valuebox">
+              <div class="valuelabel">Value estimate (White's view)</div>
+              <div class="evalbar" aria-hidden="true"><div id="liveBar" class="evalfill"></div></div>
+              <div class="valuetext" id="liveValue">–</div>
+            </div>
+            <table class="moves-table">
+              <caption>Network's top moves</caption>
+              <thead><tr><th>Move</th><th>Net prior</th><th>Search share</th></tr></thead>
+              <tbody id="liveTop"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="charts-head">
+          <h2>Metrics</h2>
+          <label class="inline-label">Run <select id="chartRun"></select></label>
+        </div>
+        <div class="charts">
+          <figure><figcaption>Loss</figcaption><div id="chLoss" class="chart"></div></figure>
+          <figure><figcaption>Self-play games / sec</figcaption><div id="chGps" class="chart"></div></figure>
+          <figure><figcaption>CPU usage, overall %</figcaption><div id="chCpu" class="chart"></div></figure>
+          <figure><figcaption>CPU usage per core, now %</figcaption><div id="chCores" class="chart"></div></figure>
+          <figure><figcaption>Outcomes, last 100 games %</figcaption><div id="chWdl" class="chart"></div></figure>
+          <figure><figcaption>Average game length, last 100 games (plies)</figcaption><div id="chLen" class="chart"></div></figure>
+          <figure><figcaption>Strength: Elo-style rating (random play = 0)</figcaption><div id="chElo" class="chart"></div></figure>
+          <figure><figcaption>Evaluation score %</figcaption><div id="chScore" class="chart"></div></figure>
+        </div>
+        <details class="table-view">
+          <summary>Evaluation table</summary>
+          <table class="data-table">
+            <thead><tr><th>Games</th><th>Checkpoint</th><th>Opponent</th><th>W</th><th>D</th><th>L</th><th>Score</th></tr></thead>
+            <tbody id="evalTable"></tbody>
+          </table>
+        </details>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== PLAY ============================== -->
+<section id="tab-play" class="tab-panel">
+  <div class="play-grid">
+    <div class="card">
+      <div class="board-wrap big"><div id="playBoard" class="board"></div></div>
+      <p id="playStatus" class="play-status">Choose a checkpoint and press New game.</p>
+    </div>
+    <aside class="side">
+      <div class="card">
+        <h2>Game</h2>
+        <label>Opponent checkpoint <select id="playCkpt"></select></label>
+        <div class="grid2">
+          <label>You play
+            <select id="playColor"><option value="white">White</option><option value="black">Black</option></select>
+          </label>
+          <label>Strength (simulations) <input type="number" id="playSims" min="1" max="20000" value="200"></label>
+        </div>
+        <div class="buttons">
+          <button id="btnNew" class="primary">New game</button>
+          <button id="btnUndo">Undo</button>
+          <button id="btnFlip">Flip board</button>
+          <button id="btnPgn">Export PGN</button>
+        </div>
+        <label class="toggle"><input type="checkbox" id="showAnalysis"> Show engine evaluation and candidate moves</label>
+      </div>
+      <div class="card" id="analysisCard" hidden>
+        <h2>Engine analysis <span class="muted" id="anaInfo"></span></h2>
+        <div class="valuebox">
+          <div class="evalbar" aria-hidden="true"><div id="anaBar" class="evalfill"></div></div>
+          <div class="valuetext" id="anaValue">–</div>
+        </div>
+        <table class="moves-table">
+          <thead><tr><th>Candidate</th><th>Visits</th><th>Share</th><th>Value</th></tr></thead>
+          <tbody id="anaTop"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>Moves</h2>
+        <ol id="moveList" class="movelist"></ol>
+        <div id="pgnBox" hidden>
+          <textarea id="pgnText" rows="6" readonly></textarea>
+          <div class="buttons"><button id="btnPgnCopy">Copy</button><button id="btnPgnSave">Download .pgn</button></div>
+        </div>
+      </div>
+    </aside>
+  </div>
+  <dialog id="promoDialog">
+    <p>Promote to</p>
+    <div class="buttons">
+      <button value="q">Queen</button><button value="r">Rook</button>
+      <button value="b">Bishop</button><button value="n">Knight</button>
+    </div>
+  </dialog>
+</section>
+</main>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

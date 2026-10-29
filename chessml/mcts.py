@@ -77,7 +77,9 @@ class SearchTree:
             child = self.root.children[self.root.moves.index(move)]
         self.board.push(move)
         self.history[_key(self.board)] += 1
-        self.root = child if child is not None else Node()
+        # A node the search scored as a draw by repetition is not the end of
+        # the real game, so it cannot serve as a root: start a fresh one.
+        self.root = child if child is not None and child.terminal is None else Node()
 
     def visit_distribution(self) -> tuple[list[chess.Move], np.ndarray]:
         root = self.root
@@ -136,7 +138,7 @@ class MCTS:
             for t in trees:
                 if t.root.expanded and not t.root.noised:
                     self._add_noise(t.root)
-        active = [t for t in trees if t.root.moves and t.root.visits() < num_sims]
+        active = [t for t in trees if t.root.moves and t.root.terminal is None and t.root.visits() < num_sims]
         while active:
             pending = []
             for tree in active:

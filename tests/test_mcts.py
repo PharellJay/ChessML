@@ -80,3 +80,21 @@ def test_terminal_root_has_no_moves():
     tree = SearchTree(stalemate)
     MCTS(uniform_eval).run([tree], num_sims=10)
     assert tree.root.moves == [] and tree.root.terminal == 0.0
+
+
+def test_reused_repetition_node_does_not_stall_search():
+    # After Nf3 Nf6 Ng1, the reply Ng8 repeats the start position, which the
+    # search scores as a draw. Moving into it must still allow a new search.
+    board = chess.Board()
+    for uci in ("g1f3", "g8f6", "f3g1"):
+        board.push_uci(uci)
+    mcts = MCTS(uniform_eval)
+    tree = SearchTree(board)
+    mcts.run([tree], num_sims=200)
+    back = chess.Move.from_uci("f6g8")
+    child = tree.root.children[tree.root.moves.index(back)]
+    assert child is not None and child.terminal == 0.0
+    tree.advance(back)
+    mcts.run([tree], num_sims=20)
+    assert tree.root.visits() >= 20
+    assert mcts.choose_move(tree) in tree.board.legal_moves

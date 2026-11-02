@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChessML</title>
+  <link rel="stylesheet" href="/static/vendor/chessboard-1.0.0.min.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/vendor/jquery-3.7.1.min.js"></script>
+  <script src="/static/vendor/chessboard-1.0.0.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <h1>ChessML</h1>
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="train" role="tab">Train</button>
+    <button class="tab" data-tab="play" role="tab">Play</button>
+    <button class="tab" data-tab="strength" role="tab">Strength</button>
+  </nav>
+  <span id="conn" class="conn" title="Live connection">connecting…</span>
+</header>
+
+<main>
+<!-- ============================== TRAIN ============================== -->
+<section id="tab-train" class="tab-panel active">
+  <div class="train-grid">
+    <aside class="side">
+      <div class="card">
+        <h2>Training</h2>
+        <form id="trainForm" autocomplete="off">
+          <div class="machine-pick">
+            <label for="machine">Machine</label>
+            <div class="machine-row">
+              <select id="machine"></select>
+              <button type="button" id="btnNewMachine">New machine</button>
+            </div>
+            <p class="hint" id="machineInfo"></p>
+            <details id="machineCkpts">
+              <summary>Checkpoints <span class="muted" id="ckptCount"></span></summary>
+              <ol id="ckptList" class="ckpt-list"></ol>
+            </details>
+          </div>
+          <label>Intensity preset
+            <select id="preset">
+              <option value="light">Light</option>
+              <option value="balanced" selected>Balanced</option>
+              <option value="heavy">Heavy</option>
+              <option value="hardcore">Hardcore</option>
+            </select>
+          </label>
+          <p class="hint" id="presetHint"></p>
+          <details>
+            <summary>Manual overrides</summary>
+            <div class="grid2">
+              <label>Workers <input type="number" id="workers" min="1" max="256"></label>
+              <label>Torch threads <input type="number" id="threads" min="1" max="256"></label>
+              <label>Simulations / move <input type="number" id="sims" min="1" max="5000"></label>
+              <label>Batch size <input type="number" id="batch_size" min="1" max="8192"></label>
+              <label>Niceness <input type="number" id="nice" min="0" max="19"></label>
+              <label>Replay buffer (positions) <input type="number" id="buffer_size" min="1000" max="5000000" step="1000"></label>
+            </div>
+            <p class="hint">Empty fields use the preset value.</p>
+          </details>
+          <label>Mode
+            <select id="mode">
+              <option value="self" selected>Self-play</option>
+              <option value="engine">Self-play + games against Stockfish</option>
+            </select>
+          </label>
+          <fieldset id="engineFields" hidden>
+            <legend>Opponent</legend>
+            <div class="grid2">
+              <label>Games vs Stockfish % <input type="number" id="engineShare" min="1" max="100" value="50"></label>
+              <label>Starting level (0-20) <input type="number" id="engineLevel" min="0" max="20" value="0"></label>
+            </div>
+            <label class="toggle"><input type="checkbox" id="engineAdaptive" checked> Adapt the level to the network's results</label>
+            <label>Engine binary (optional) <input type="text" id="enginePath" placeholder="stockfish on PATH"></label>
+            <p class="hint" id="engineHint"></p>
+          </fieldset>
+          <fieldset>
+            <legend>Duration</legend>
+            <label class="radio"><input type="radio" name="duration" value="stop" checked> Until I press Stop</label>
+            <label class="radio"><input type="radio" name="duration" value="games"> Games
+              <input type="number" id="games" min="1" value="500" class="inline"></label>
+            <label class="radio"><input type="radio" name="duration" value="time"> Time
+              <input type="text" id="time" value="2h" class="inline" placeholder="2h, 90m"></label>
+          </fieldset>
+          <div class="buttons">
+            <button type="submit" id="btnStart" class="primary">Start</button>
+            <button type="button" id="btnPause">Pause</button>
+            <button type="button" id="btnResume">Resume</button>
+            <button type="button" id="btnStop" class="danger">Stop</button>
+          </div>
+          <p class="error" id="trainError" role="alert"></p>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Status <span id="stateBadge" class="badge">idle</span></h2>
+        <dl class="stats" id="statusList">
+          <dt>Machine</dt><dd id="st-run">–</dd>
+          <dt>Preset</dt><dd id="st-preset">–</dd>
+          <dt>Opponent</dt><dd id="st-opponent">–</dd>
+          <dt>Duration</dt><dd id="st-duration">–</dd>
+          <dt>Elapsed</dt><dd id="st-elapsed">–</dd>
+          <dt>ETA</dt><dd id="st-eta">–</dd>
+          <dt>Games played</dt><dd id="st-games">–</dd>
+          <dt>Games / sec</dt><dd id="st-gps">–</dd>
+          <dt>Positions</dt><dd id="st-positions">–</dd>
+          <dt>Net evals / sec</dt><dd id="st-eps">–</dd>
+          <dt>Training steps</dt><dd id="st-steps">–</dd>
+          <dt>Learning rate</dt><dd id="st-lr">–</dd>
+          <dt>Resignation</dt><dd id="st-resign">–</dd>
+          <dt>Replay buffer</dt><dd id="st-buffer">–</dd>
+          <dt>Checkpoint</dt><dd id="st-ckpt">–</dd>
+          <dt>Strength</dt><dd id="st-elo">–</dd>
+        </dl>
+      </div>
+
+      <div class="card">
+        <h2>Log</h2>
+        <ol id="log" class="log"><li class="placeholder">Training messages appear here while this page is open.</li></ol>
+      </div>
+    </aside>
+
+    <div class="main-col">
+      <div class="card live">
+        <h2>Live training games <span class="muted" id="liveInfo"></span></h2>
+        <div class="live-grid">
+          <div class="board-wrap"><div id="liveBoard" class="board"></div></div>
+          <div class="live-side">
+            <div class="valuebox">
+              <div class="valuelabel">Value estimate (White's view)</div>
+              <div class="evalbar" aria-hidden="true"><div id="liveBar" class="evalfill"></div></div>
+              <div class="valuetext" id="liveValue">–</div>
+            </div>
+            <table class="moves-table">
+              <caption>Network's top moves</caption>
+              <thead><tr><th>Move</th><th>Net prior</th><th>Search share</th></tr></thead>
+              <tbody id="liveTop"></tbody>
+            </table>
+          </div>
+        </div>
+        <h3 class="mini-head">All running games <span class="muted" id="gridInfo"></span></h3>
+        <div id="liveGrid" class="mini-grid"></div>
+      </div>
+
+      <div class="card">
+        <div class="charts-head">
+          <h2>Metrics</h2>
+          <label class="inline-label">Machine <select id="chartRun"></select></label>
+        </div>
+        <div class="charts">
+          <figure><figcaption>Loss</figcaption><div id="chLoss" class="chart"></div></figure>
+          <figure><figcaption>Self-play games / sec</figcaption><div id="chGps" class="chart"></div></figure>
+          <figure><figcaption>CPU usage, overall %</figcaption><div id="chCpu" class="chart"></div></figure>
+          <figure><figcaption>CPU usage per core, now %</figcaption><div id="chCores" class="chart"></div></figure>
+          <figure><figcaption>Outcomes, last 100 games %</figcaption><div id="chWdl" class="chart"></div></figure>
+          <figure><figcaption>Average game length, last 100 games (plies)</figcaption><div id="chLen" class="chart"></div></figure>
+          <figure><figcaption id="eloCaption">Strength: Elo-style rating (random play = 0)</figcaption><div id="chElo" class="chart"></div></figure>
+          <figure><figcaption>Evaluation score %</figcaption><div id="chScore" class="chart"></div></figure>
+          <figure><figcaption>Network's score vs Stockfish, last 50 engine games %</figcaption><div id="chEngScore" class="chart"></div></figure>
+          <figure><figcaption>Stockfish level (0-20)</figcaption><div id="chEngLevel" class="chart"></div></figure>
+        </div>
+        <details class="table-view">
+          <summary>Evaluation table</summary>
+          <table class="data-table">
+            <thead><tr><th>Games</th><th>Checkpoint</th><th>Opponent</th><th>W</th><th>D</th><th>L</th><th>Score</th></tr></thead>
+            <tbody id="evalTable"></tbody>
+          </table>
+        </details>
+      </div>
+    </div>
+  </div>
+</section>
+
+<dialog id="machineDialog">
+  <form id="machineForm" class="machine-form" autocomplete="off">
+    <h2>New machine</h2>
+    <label>Name <input type="text" id="machineName" maxlength="60" placeholder="e.g. hardcore-24h" required></label>
+    <label>Start from
+      <select id="machineFrom"><option value="">An untrained network</option></select>
+    </label>
+    <p class="hint">Starting from a checkpoint copies it into the new machine, which then trains on from there.</p>
+    <p class="error" id="machineError" role="alert"></p>
+    <div class="buttons">
+      <button type="submit" class="primary">Create machine</button>
+      <button type="button" id="machineCancel">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- ============================== PLAY ============================== -->
+<section id="tab-play" class="tab-panel">
+  <div class="play-grid">
+    <div class="card">
+      <div class="board-wrap big"><div id="playBoard" class="board"></div></div>
+      <p id="playStatus" class="play-status">Choose a checkpoint and press New game.</p>
+    </div>
+    <aside class="side">
+      <div class="card">
+        <h2>Game</h2>
+        <label>Opponent checkpoint <select id="playCkpt"></select></label>
+        <div class="grid2">
+          <label>You play
+            <select id="playColor"><option value="white">White</option><option value="black">Black</option></select>
+          </label>
+          <label title="Search simulations: each one has the network evaluate one more position">Strength (positions / move)
+            <input type="number" id="playSims" min="1" max="20000" value="200"></label>
+        </div>
+        <p class="hint">How many positions the engine looks at before each move – a search budget, not a time limit.
+          Higher is stronger but slower: 1 plays on the network's instinct alone, 200 is a good default,
+          2000+ plays much better but can take several seconds a move. <span id="playSimsInfo"></span></p>
+        <div class="buttons">
+          <button id="btnNew" class="primary">New game</button>
+          <button id="btnUndo">Undo</button>
+          <button id="btnFlip">Flip board</button>
+          <button id="btnPgn">Export PGN</button>
+        </div>
+        <label class="toggle"><input type="checkbox" id="showAnalysis"> Show engine evaluation and candidate moves</label>
+      </div>
+      <div class="card" id="analysisCard" hidden>
+        <h2>Engine analysis <span class="muted" id="anaInfo"></span></h2>
+        <div class="valuebox">
+          <div class="evalbar" aria-hidden="true"><div id="anaBar" class="evalfill"></div></div>
+          <div class="valuetext" id="anaValue">–</div>
+        </div>
+        <table class="moves-table">
+          <thead><tr><th>Candidate</th><th>Visits</th><th>Share</th><th>Value</th></tr></thead>
+          <tbody id="anaTop"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>Moves</h2>
+        <ol id="moveList" class="movelist"></ol>
+        <div id="pgnBox" hidden>
+          <textarea id="pgnText" rows="6" readonly></textarea>
+          <div class="buttons"><button id="btnPgnCopy">Copy</button><button id="btnPgnSave">Download .pgn</button></div>
+        </div>
+      </div>
+    </aside>
+  </div>
+  <dialog id="promoDialog">
+    <p>Promote to</p>
+    <div class="buttons">
+      <button value="q">Queen</button><button value="r">Rook</button>
+      <button value="b">Bishop</button><button value="n">Knight</button>
+    </div>
+  </dialog>
+</section>
+
+<!-- ============================== STRENGTH ============================== -->
+<section id="tab-strength" class="tab-panel">
+  <div class="train-grid">
+    <aside class="side">
+      <div class="card">
+        <h2>Calibration <span id="calBadge" class="badge">–</span></h2>
+        <p class="hint" id="calStatus">Loading…</p>
+        <details id="calOptions">
+          <summary>Options</summary>
+          <div class="grid2">
+            <label>Games per match <input type="number" id="calGames" min="2" max="200" value="20"></label>
+            <label>Processes <input type="number" id="calProcs" min="1"></label>
+          </div>
+        </details>
+        <div class="buttons">
+          <button id="btnCalibrate">Calibrate</button>
+          <button id="btnRefine" hidden title="Play more calibration games where they narrow the ladder most">Refine</button>
+        </div>
+        <p class="hint" id="calHint"></p>
+      </div>
+
+      <div class="card">
+        <h2>Measure a checkpoint</h2>
+        <label>Checkpoint <select id="msCkpt"></select></label>
+        <div class="grid2">
+          <label>Games per opponent <input type="number" id="msGames" min="2" max="200" value="20"></label>
+          <label>Simulations / move <input type="number" id="msSims" min="1" max="5000" value="64"></label>
+        </div>
+        <label>Processes <input type="number" id="msProcs" min="1"></label>
+        <div class="buttons"><button id="btnMeasure" class="primary">Measure Elo</button></div>
+        <p class="hint" id="msHint"></p>
+        <p class="error" id="strengthError" role="alert"></p>
+      </div>
+
+      <div class="card" id="jobCard" hidden>
+        <h2><span id="jobTitle">Job</span> <span id="jobBadge" class="badge">–</span></h2>
+        <div class="progress" aria-hidden="true"><div id="jobBar" class="progress-fill"></div></div>
+        <p class="hint" id="jobText"></p>
+        <ol id="jobMatches" class="log"></ol>
+        <div class="buttons"><button id="btnCancelJob" class="danger">Cancel</button></div>
+      </div>
+    </aside>
+
+    <div class="main-col">
+      <div class="card" id="jobLiveCard" hidden>
+        <h2>Live games <span class="muted" id="jobLiveInfo"></span></h2>
+        <div class="live-grid">
+          <div class="board-wrap"><div id="jobBoard" class="board"></div></div>
+          <div class="live-side">
+            <dl class="stats">
+              <dt>White</dt><dd id="jg-white">–</dd>
+              <dt>Black</dt><dd id="jg-black">–</dd>
+              <dt>Game</dt><dd id="jg-game">–</dd>
+              <dt>Ply</dt><dd id="jg-ply">–</dd>
+              <dt>Result</dt><dd id="jg-result">–</dd>
+            </dl>
+            <p class="hint jg-note">Each match plays all its games at once, alternating colours. Positions refresh
+              once a second.</p>
+          </div>
+        </div>
+        <h3 class="mini-head">All games in progress <span class="muted" id="jobGridInfo"></span></h3>
+        <div id="jobGrid" class="mini-grid"></div>
+      </div>
+
+      <div class="card">
+        <h2>Result <span class="muted" id="resWhen"></span></h2>
+        <div id="resEmpty" class="empty-note">No measurement yet. Calibrate once, then measure a checkpoint.</div>
+        <div id="resBody" hidden>
+          <div class="hero">
+            <div class="hero-elo"><span id="resElo">–</span><span class="hero-unit">Elo</span></div>
+            <div class="hero-side">
+              <div class="hero-ci" id="resCi"></div>
+              <div class="hero-name" id="resName"></div>
+            </div>
+          </div>
+          <p class="hero-text" id="resText"></p>
+          <table class="data-table">
+            <thead><tr><th>Opponent</th><th>Its Elo</th><th>W</th><th>D</th><th>L</th><th>Score</th></tr></thead>
+            <tbody id="resTable"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Ladder <span class="muted">Elo with 95% interval</span></h2>
+        <div id="ladder" class="ladder"></div>
+        <p class="hint ladder-note">Stockfish's <code>UCI_Elo</code> players are the fixed anchors. Everything else is
+          rated from games on the ladder: random moves, the greedy material player, Stockfish strength levels, and
+          the checkpoints you measured.</p>
+      </div>
+
+      <div class="card">
+        <h2>Measurements</h2>
+        <table class="data-table clickable history-table">
+          <thead><tr><th>Checkpoint</th><th>Elo</th><th>95%</th><th>Games</th><th>Sims</th><th>When</th></tr></thead>
+          <tbody id="resHistory"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

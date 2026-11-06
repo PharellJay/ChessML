@@ -39,13 +39,22 @@ def new_run_dir(name: str | None = None) -> Path:
 
 
 RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,59}")
+BOOTSTRAP_EPOCHS = 4  # passes over the source buffer; four brought an 8x96 net close to its 4x48 source
+MAX_BLOCKS, MAX_CHANNELS = 40, 512
 
 
-def create_run(name: str, from_checkpoint: str | Path | None = None) -> Path:
+def create_run(name: str, from_checkpoint: str | Path | None = None, blocks: int | None = None,
+               channels: int | None = None, bootstrap: str | None = None,
+               bootstrap_epochs: int = BOOTSTRAP_EPOCHS) -> Path:
     """Create a named run, empty or starting from a copy of a checkpoint.
 
     The copy becomes the run's first checkpoint, so training the run
     continues from it exactly as it would continue from its own checkpoint.
+
+    An untrained run can instead get its own network size (`blocks` x
+    `channels`) and a `bootstrap` source: another run whose saved replay
+    buffer is copied in. Its first training session then pre-trains the new
+    network on those positions before self-play starts (Trainer._pretrain).
     """
     name = name.strip()
     if not RUN_NAME.fullmatch(name):
@@ -53,9 +62,34 @@ def create_run(name: str, from_checkpoint: str | Path | None = None) -> Path:
     path = runs_dir() / name
     if path.exists():
         raise FileExistsError(f"a machine named {name!r} already exists")
+    if from_checkpoint and (blocks or channels or bootstrap):
+        raise ValueError("a machine started from a checkpoint keeps that checkpoint's network size and training")
+    if (blocks is None) != (channels is None):
+        raise ValueError("give both the number of blocks and the channels per block")
+    if blocks is not None and not (1 <= blocks <= MAX_BLOCKS and 8 <= channels <= MAX_CHANNELS):
+        raise ValueError(f"network size must be 1-{MAX_BLOCKS} blocks of 8-{MAX_CHANNELS} channels")
+    source_buffer = None
+    if bootstrap:
+        bootstrap_run = resolve_run(bootstrap)
+        source_buffer = bootstrap_run / "buffer.npz"
+        if not source_buffer.is_file():
+            raise FileNotFoundError(f"machine {bootstrap_run.name!r} has no saved replay buffer yet "
+                                    "(it is written when a training session stops)")
+        if not 1 <= bootstrap_epochs <= 50:
+            raise ValueError("pre-training passes must be between 1 and 50")
     (path / "checkpoints").mkdir(parents=True)
     state = {"status": "new", "games": 0, "steps": 0, "positions": 0, "elapsed": 0.0, "checkpoint": None,
              "updated": time.time()}
+    if blocks is not None:
+        state["net"] = {"blocks": blocks, "channels": channels}
+    if source_buffer is not None:
+        import numpy as np
+
+        shutil.copyfile(source_buffer, path / "buffer.npz")  # loaded like the run's own buffer when it starts
+        with np.load(path / "buffer.npz") as data:
+            positions = int(data["z"].shape[0])
+        state["bootstrap"] = {"source": bootstrap_run.name, "positions": positions, "epochs": bootstrap_epochs,
+                              "steps_done": 0, "done": False}
     if from_checkpoint:
         from .network import load_checkpoint
 
@@ -114,6 +148,9 @@ def list_runs() -> list[dict]:
         if not (path / "checkpoints").is_dir():
             continue
         state = read_json(path / "state.json", {}) or {}
+        config = read_json(path / "config.json", {}) or {}
+        net = state.get("net") or ({"blocks": config["blocks"], "channels": config["channels"]}
+                                   if "blocks" in config and "channels" in config else None)
         out.append({
             "name": path.name,
             "path": str(path),
@@ -124,6 +161,9 @@ def list_runs() -> list[dict]:
             "preset": state.get("preset"),
             "checkpoints": len(run_checkpoints(path)),
             "origin": state.get("origin"),
+            "net": net,  # None until the first session of a run created without a size
+            "bootstrap": state.get("bootstrap"),
+            "has_buffer": (path / "buffer.npz").is_file(),
             "updated": path.stat().st_mtime,
         })
     out.sort(key=lambda r: r["updated"], reverse=True)

@@ -170,6 +170,30 @@ def test_bracket_players_surround_a_rating():
     assert bracket_players(cal, 2000) == ["sf-elo-1320", "sf-level-5"]
 
 
+def test_bracket_estimate_is_anchored_by_history():
+    from chessml.elo import bracket_estimate
+
+    cal = {"anchors": {"sf-elo-1320": 1320.0}, "players": default_players(),
+           "ratings": {"random": -200.0, "material": 700.0, "sf-level-9": 1250.0, "sf-elo-1320": 1320.0,
+                       "sf-elo-1900": 1900.0},
+           "records": [["random", "material", 0, 0, 20], ["material", "sf-level-9", 1, 1, 18],
+                       ["sf-level-9", "sf-elo-1320", 9, 0, 11], ["sf-elo-1320", "sf-elo-1900", 1, 0, 19]]}
+    rec = lambda a, b, w, d, l: {"player": a, "opponent": b, "wins": w, "draws": d, "losses": l}  # noqa: E731
+    # a sweep of the baselines plus a loss to the previous checkpoint, which alone anchors nothing
+    records = [rec("new", "random", 10, 0, 0), rec("new", "material", 10, 0, 0), rec("new", "old", 2, 1, 7)]
+    history = [rec("old", "random", 10, 0, 0), rec("old", "material", 9, 1, 0),
+               rec("old", "sf-level-9", 13, 1, 6), rec("old", "sf-elo-1320", 9, 1, 10)]
+    unanchored = bracket_estimate(cal, records, "new")
+    anchored = bracket_estimate(cal, records, "new", history)
+    assert unanchored > 1700  # the old behaviour: bracketed against the top of the ladder
+    assert 900 < anchored < 1400
+    assert bracket_players(cal, anchored) != bracket_players(cal, unanchored)
+    # a clean sweep has no finite estimate: fall back to the last known Elo
+    sweep = [rec("new", "random", 10, 0, 0), rec("new", "material", 10, 0, 0), rec("new", "old", 10, 0, 0)]
+    assert bracket_estimate(cal, sweep, "new", history, hint=1300.0) == 1300.0
+    assert bracket_estimate(cal, records, "new", history, hint=1300.0) == anchored  # a hint only for sweeps
+
+
 def test_evaluation_brackets_the_estimate(tmp_path, monkeypatch, fake_engine):
     from chessml.elo import engine_setup
     from chessml.evaluation import evaluate_checkpoint

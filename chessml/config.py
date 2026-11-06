@@ -120,8 +120,10 @@ class TrainConfig:
     # optimisation
     lr: float = 1e-3
     lr_patience: int = 3  # evaluations without a new best rating before the learning rate drops (0 = never)
+    lr_window: int = 3  # evaluations averaged per rating in that rule, against the noise of short matches
     lr_drop: float = 0.3  # factor applied at each drop
-    min_lr: float = 1e-5
+    min_lr: float = 1e-4  # self-play data keeps changing; a rate far below this stops the network following it
+    reset_lr: bool = False  # this session only: undo earlier drops and start the plateau rule afresh
     weight_decay: float = 1e-4
     buffer_size: int = 100_000
     min_buffer: int = 1_000

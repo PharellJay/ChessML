@@ -150,20 +150,122 @@ def test_machines_start_untrained_or_from_a_checkpoint(tmp_path, monkeypatch):
     assert read_json(fresh / "state.json")["games"] == games  # and left the original untouched
 
 
+
+def test_machine_with_its_own_size_and_pretraining_rules(tmp_path, monkeypatch):
+    from chessml.runs import create_run
+
+    monkeypatch.setenv("CHESSML_RUNS", str(tmp_path))
+    empty = create_run("empty")
+    with pytest.raises(FileNotFoundError):  # no saved replay buffer to pre-train on
+        create_run("a", blocks=2, channels=16, bootstrap="empty")
+    with pytest.raises(ValueError):
+        create_run("b", blocks=2)  # size needs both numbers
+    with pytest.raises(ValueError):
+        create_run("c", blocks=2, channels=4096)
+    sized = create_run("sized", blocks=2, channels=16)
+    assert read_json(sized / "state.json")["net"] == {"blocks": 2, "channels": 16}
+    trainer = Trainer(tiny_config(max_games=2), Control(), None, resume=str(sized))
+    assert trainer.run() == "completed"
+    from chessml.network import load_checkpoint
+    assert load_checkpoint(str(latest_checkpoint(sized)))["net"] == {"blocks": 2, "channels": 16}
+    assert read_json(sized / "state.json")["net"] == {"blocks": 2, "channels": 16}  # kept by later saves
+    with pytest.raises(ValueError):  # a fork keeps its checkpoint's size
+        create_run("d", latest_checkpoint(sized), blocks=4, channels=48)
+    assert not (tmp_path / "a").exists() and not (tmp_path / "d").exists()
+    assert empty.exists()
+
+
+def test_pretraining_on_another_machines_buffer(tmp_path, monkeypatch):
+    from chessml.network import load_checkpoint
+    from chessml.runs import create_run, list_runs
+
+    monkeypatch.setenv("CHESSML_RUNS", str(tmp_path))
+    source = Trainer(tiny_config(max_games=6, max_plies=24), Control(), None, run_name="src")
+    assert source.run() == "completed"
+    positions = int(np.load(source.run_dir / "buffer.npz")["z"].shape[0])
+
+    big = create_run("big", blocks=2, channels=24, bootstrap="src", bootstrap_epochs=2)
+    info = read_json(big / "state.json")["bootstrap"]
+    assert info == {"source": "src", "positions": positions, "epochs": 2, "steps_done": 0, "done": False}
+    assert {r["name"]: r for r in list_runs()}["big"]["net"] == {"blocks": 2, "channels": 24}
+
+    # stop after the first logged losses: the pre-training is saved part-way
+    control, events = Control(), []
+
+    def emit(event):
+        events.append(event)
+        if event["type"] == "train":
+            control.stop.set()
+
+    batch = 2  # small batches: enough steps per pass, and a held-out share on a tiny buffer
+    trainer = Trainer(tiny_config(max_games=2, batch_size=batch), control, emit, resume=str(big))
+    assert trainer.run() == "stopped"
+    state = read_json(big / "state.json")
+    assert state["status"] == "stopped" and state["games"] == 0
+    assert 0 < state["bootstrap"]["steps_done"] < state["bootstrap"]["steps_total"]
+    assert not state["bootstrap"]["done"]
+    assert not any(e["type"] == "game" for e in events)  # no self-play before the pre-training ends
+
+    events = []
+    trainer = Trainer(tiny_config(max_games=2, batch_size=batch), Control(), events.append, resume=str(big))
+    assert trainer.run() == "completed"
+    state = read_json(big / "state.json")
+    assert state["bootstrap"]["done"] and state["games"] == 2
+    held = positions // 20
+    assert state["bootstrap"]["steps_total"] == 2 * ((positions - held) // batch)
+    assert 1 <= state["bootstrap"]["best_epoch"] <= 2
+    logs = [e["message"] for e in events if e["type"] == "log"]
+    assert any("continuing at step" in m for m in logs)
+    assert any("held-out loss" in m for m in logs) and any("Pre-training finished" in m for m in logs)
+    first = load_checkpoint(str(big / "checkpoints" / "ckpt_000000g.pt"))
+    assert first["net"] == {"blocks": 2, "channels": 24} and first["steps"] >= state["bootstrap"]["steps_total"]
+    assert not (big / "pretrain_best.pt").exists()
+    # a later session does not pre-train again
+    events = []
+    assert Trainer(tiny_config(max_games=1, batch_size=batch), Control(), events.append, resume=str(big)).run() == "completed"
+    assert not any("pre-training" in e.get("message", "").lower() for e in events if e["type"] == "log")
+
+def _rated(*ratings, step=100):
+    return [{"checkpoint": f"c{i * step}", "games": i * step, "rating": r} for i, r in enumerate(ratings)]
+
+
 def test_learning_rate_drops_on_a_rating_plateau():
     from chessml.trainer import lr_after_eval
 
-    points = [{"checkpoint": f"c{g}", "games": g, "rating": r} for g, r in ((0, 0), (100, 300), (200, 250),
-                                                                             (300, 290), (400, 280), (500, 350))]
-    assert lr_after_eval(points, "c100", 2, 3) == (0, False)  # a new best resets the count
-    stale = 0
-    stale, drop = lr_after_eval(points, "c200", stale, 3)
-    assert (stale, drop) == (1, False)
-    stale, drop = lr_after_eval(points, "c300", stale, 3)
-    stale, drop = lr_after_eval(points, "c400", stale, 3)
-    assert drop and stale == 0  # three evaluations without beating 300
-    assert lr_after_eval(points, "c500", 0, 3) == (0, False)
-    assert lr_after_eval(points, "c400", 5, 0) == (6, False)  # patience 0: never drops
+    points = _rated(0, 300, 250, 290, 280, 350)
+    assert lr_after_eval(points, "c100", 3, window=1) == (0, False)  # a new best
+    assert lr_after_eval(points, "c200", 3, window=1) == (1, False)
+    assert lr_after_eval(points, "c300", 3, window=1) == (2, False)
+    assert lr_after_eval(points, "c400", 3, window=1) == (3, True)  # three evaluations without beating 300
+    assert lr_after_eval(points, "c500", 3, window=1) == (0, False)
+    assert lr_after_eval(points, "c400", 0, window=1) == (3, False)  # patience 0: never drops
+    assert lr_after_eval(points, "unknown", 3) == (0, False)
+
+
+def test_learning_rate_ignores_a_single_lucky_rating():
+    from chessml.trainer import lr_after_eval
+
+    # a steady climb with one spike: compared one by one, nothing after the spike beats it
+    points = _rated(100, 200, 300, 700, 350, 400, 450, 500, 550)
+    assert lr_after_eval(points, "c800", 3, window=1) == (5, True)
+    # averaged over three evaluations the spike is diluted: the climb overtakes it before patience runs out
+    assert lr_after_eval(points, "c700", 3, window=3) == (2, False)
+    assert lr_after_eval(points, "c800", 3, window=3) == (0, False)
+    # a real plateau still drops: smoothed 300 345 330 330 300 300 300, nothing beats 345 for five evaluations
+    flat = _rated(300, 390, 300, 300, 300, 300, 300)
+    assert lr_after_eval(flat, "c600", 3, window=3) == (5, True)
+
+
+def test_learning_rate_rule_restarts_after_a_change():
+    from chessml.trainer import lr_after_eval
+
+    points = _rated(900, 500, 520, 540, 530, 560)  # an old best of 900 that nothing reaches again
+    assert lr_after_eval(points, "c500", 3, window=1)[1]  # compared with it, every later checkpoint is stale
+    # compared only from the last change (game 100) on, the run is still improving
+    assert lr_after_eval(points, "c500", 3, window=1, since=100) == (0, False)
+    assert lr_after_eval(points, "c400", 3, window=1, since=100) == (1, False)
+    assert lr_after_eval(points, "c100", 3, window=1, since=100) == (0, False)  # the first one is the best
+    assert lr_after_eval(points, "c0", 3, since=100) == (0, False)  # from before the change: no verdict
 
 
 def test_learning_rate_scale_survives_a_resume(tmp_path, monkeypatch):
@@ -179,6 +281,29 @@ def test_learning_rate_scale_survives_a_resume(tmp_path, monkeypatch):
     resumed._setup()
     assert abs(resumed.optimizer.param_groups[0]["lr"] - 3e-4) < 1e-12
     resumed.db.close()
+
+
+def test_reset_lr_undoes_earlier_drops(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHESSML_RUNS", str(tmp_path))
+    trainer = Trainer(tiny_config(max_games=2), Control(), None, run_name="reset")
+    trainer._setup()
+    trainer.lr_scale, trainer.lr_since = 0.09, 0
+    trainer.games = 7
+    trainer.ladder.level = 0
+    trainer._save_checkpoint()
+    trainer.db.close()
+    # without a reset the drops stay, but never below the floor: 1e-3 * 0.09 = 9e-5 runs at 1e-4
+    kept =Trainer(tiny_config(lr=1e-3), Control(), None, resume=str(trainer.run_dir))
+    kept._setup()
+    assert abs(kept.optimizer.param_groups[0]["lr"] - 1e-4) < 1e-12
+    assert kept.lr_note is None
+    kept.db.close()
+    reset = Trainer(tiny_config(lr=1e-3, reset_lr=True), Control(), None, resume=str(trainer.run_dir))
+    reset._setup()
+    assert abs(reset.optimizer.param_groups[0]["lr"] - 1e-3) < 1e-12
+    assert (reset.lr_scale, reset.lr_since) == (1.0, 7)  # the plateau rule compares from game 7 on
+    assert "reset" in reset.lr_note
+    reset.db.close()
 
 
 def test_fast_moves_are_not_training_samples(tmp_path, monkeypatch):

@@ -26,14 +26,14 @@ import psutil
 import torch
 import torch.nn.functional as F
 
-from .config import TrainConfig, apply_niceness
+from .config import CPU_COUNT, TrainConfig, apply_niceness
 from .encoding import NUM_PLANES, POLICY_SIZE, planes_to_float
 from .elo import engine_setup, level_elo, load_calibration
 from .engine import EngineLadder, find_engine
 from .evaluation import checkpoint_ratings, compute_ratings, eval_process_main
 from .metrics import MetricsDB
 from .network import ChessNet, NetConfig, load_checkpoint, save_checkpoint
-from .runs import latest_checkpoint, new_run_dir, resolve_run, run_checkpoints, write_json
+from .runs import latest_checkpoint, new_run_dir, read_json, resolve_run, run_checkpoints, write_json
 from .selfplay import result_value, worker_main
 
 RESIGN_FALSE_MAX = 0.05  # largest acceptable share of resignations in games that were not lost
@@ -65,23 +65,35 @@ def choose_resign_threshold(samples: list[tuple[float, bool]], ceiling: float) -
     return -1.0 if count >= RESIGN_MIN_SAMPLES else None
 
 
-def lr_after_eval(points: list[dict], checkpoint: str, stale: int, patience: int) -> tuple[int, bool]:
+def lr_after_eval(points: list[dict], checkpoint: str, patience: int, window: int = 3,
+                  since: int = 0) -> tuple[int, bool]:
     """Plateau rule for the learning rate, applied after `checkpoint` was evaluated.
 
-    `points` are the run's rated checkpoints (checkpoint_ratings). A new best
-    rating resets the count of stale evaluations; `patience` stale ones in a
-    row call for a drop. Returns (new stale count, drop now).
+    `points` are the run's rated checkpoints (checkpoint_ratings), ordered by
+    games. A rating from a few evaluation games is noisy, so each checkpoint
+    counts with the mean rating of itself and the `window` - 1 checkpoints
+    before it; a single lucky result then cannot set a best that later
+    checkpoints never reach. Only checkpoints from `since` games on (the last
+    learning-rate change) compete, so a best from before a drop or a reset
+    cannot cause the next drop. The rate drops once `patience` evaluations
+    in a row have not beaten the best among them.
+
+    Returns (evaluations since that best, drop now). The rule keeps no state:
+    every evaluation refits all ratings, and the count follows from them.
     """
-    current = next((p for p in points if p["checkpoint"] == checkpoint), None)
-    if current is None:
-        return stale, False
-    earlier = [p["rating"] for p in points if p["games"] < current["games"]]
-    if not earlier or current["rating"] > max(earlier):
+    idx = next((i for i, p in enumerate(points) if p["checkpoint"] == checkpoint), None)
+    if idx is None:
         return 0, False
-    stale += 1
-    if patience and stale >= patience:
-        return 0, True
-    return stale, False
+    window = max(1, window)
+    ratings = [p["rating"] for p in points[:idx + 1]]
+    smooth = [sum(ratings[max(0, i - window + 1):i + 1]) / len(ratings[max(0, i - window + 1):i + 1])
+              for i in range(idx + 1)]
+    recent = [i for i in range(idx + 1) if points[i]["games"] >= since]
+    if not recent:
+        return 0, False
+    best = max(recent, key=lambda i: smooth[i])  # the earliest on a tie: equal is not better
+    stale = sum(1 for i in recent if i > best)
+    return stale, bool(patience) and stale >= patience
 
 
 class Control:
@@ -117,8 +129,11 @@ class ReplayBuffer:
             self.size = min(self.size + 1, self.capacity)
 
     def sample(self, n: int, rng: np.random.Generator):
-        ids = rng.integers(0, self.size, size=n)
-        target = np.zeros((n, POLICY_SIZE), dtype=np.float32)
+        return self.batch(rng.integers(0, self.size, size=n))
+
+    def batch(self, ids: np.ndarray):
+        """(planes, dense policy targets, outcomes) of the samples at `ids`."""
+        target = np.zeros((len(ids), POLICY_SIZE), dtype=np.float32)
         for row, i in enumerate(ids):
             target[row, self.pol_idx[i]] = self.pol_p[i]
         return self.planes[ids], target, self.z[ids]
@@ -182,10 +197,16 @@ class Trainer:
         if cfg.engine_share > 0:
             cfg.engine_path = find_engine(cfg.engine_path)
         data = load_checkpoint(str(ckpt_path)) if ckpt_path else None
+        run_state = read_json(self.run_dir / "state.json", {}) or {}
+        self.run_extra = {k: run_state[k] for k in ("origin", "net") if k in run_state}  # kept in state.json
+        bootstrap = run_state.get("bootstrap")
+        self.bootstrap = bootstrap if bootstrap else None
         if data:
             cfg.blocks, cfg.channels = data["net"]["blocks"], data["net"]["channels"]
             if cfg.engine_adaptive and data.get("engine_level") is not None:
                 cfg.engine_level = data["engine_level"]  # the ladder continues where it was
+        elif run_state.get("net"):  # a machine created with its own size: no checkpoint yet to read it from
+            cfg.blocks, cfg.channels = run_state["net"]["blocks"], run_state["net"]["channels"]
         self.ladder = EngineLadder(cfg.engine_level, cfg.engine_adaptive, cfg.engine_window)
         # resignation threshold: as configured, or lower if an earlier session had to lower it
         self.resign_level = cfg.resign_threshold
@@ -196,14 +217,15 @@ class Trainer:
         self.resign_new = 0  # samples since the threshold was last chosen
         self.model = ChessNet(NetConfig(cfg.blocks, cfg.channels))
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-        self.lr_scale, self.lr_stale = 1.0, 0  # learning-rate drops so far, and evaluations since the best
+        self.lr_scale = 1.0  # product of the learning-rate drops so far
+        self.lr_since = 0  # games at the last learning-rate change: the plateau rule compares from here on
         self.games = self.steps = self.positions = 0
         self.elapsed_base = 0.0
         self.active_seconds = 0.0
         self.checkpoint = None
         if data:
             self.model.load_state_dict(data["model"])
-            self.lr_scale, self.lr_stale = data.get("lr_scale", 1.0), data.get("lr_stale", 0)
+            self.lr_scale, self.lr_since = data.get("lr_scale", 1.0), data.get("lr_since", 0)
             if "optimizer" in data:
                 self.optimizer.load_state_dict(data["optimizer"])
                 for group in self.optimizer.param_groups:
@@ -213,6 +235,11 @@ class Trainer:
             self.positions = data.get("positions", 0)
             self.elapsed_base = data.get("elapsed", 0.0)
             self.checkpoint = str(ckpt_path)
+        self.lr_note = None  # logged when the session starts
+        if data and cfg.reset_lr and (self.lr_scale != 1.0 or self.lr_since):
+            self.lr_note = (f"Learning rate reset to {cfg.lr:.2g} (was {self._lr():.2g}); "
+                            f"the plateau rule starts afresh from here")
+            self.lr_scale, self.lr_since = 1.0, self.games
         for group in self.optimizer.param_groups:  # the configured rate, lowered by any earlier drops
             group["lr"] = self._lr()
         self.db = MetricsDB(self.run_dir / "metrics.db")
@@ -243,6 +270,9 @@ class Trainer:
         torch.set_num_threads(cfg.threads)
         apply_niceness(cfg.nice)
         psutil.cpu_percent(percpu=True)  # prime the CPU counters
+        self.pretrain_status = None
+        if self.bootstrap and not self.bootstrap.get("done") and not self._pretrain():
+            return "stopped"
 
         ctx = mp.get_context("spawn")
         self.weights_path = self.run_dir / "weights.pt"
@@ -286,11 +316,13 @@ class Trainer:
         self.loss_acc = [0.0, 0.0, 0.0, 0]
         self.last_rates = (time.time(), self.positions, 0)
         self.rates = {"games_per_sec": 0.0, "positions_per_sec": 0.0, "evals_per_sec": 0.0}
-        self.db.insert("sessions", {"elapsed": self.elapsed_base, "event": "start",
+        self.db.insert("sessions", {"elapsed": self._elapsed(), "event": "start",
                                     "detail": f"preset={cfg.preset} workers={cfg.workers} {cfg.duration_text()}"
                                               + ("" if cfg.engine_share <= 0 else f", {cfg.opponent_text()}")})
         self.emit({"type": "log", "message": f"Machine {self.run_dir.name} started: {cfg.preset} preset, "
                                             f"{cfg.workers} workers, {cfg.duration_text()}, {cfg.opponent_text()}"})
+        if self.lr_note:
+            self.emit({"type": "log", "message": self.lr_note})
 
         now = time.time()
         last_tick = last_status = last_ckpt = last_eval = now
@@ -446,7 +478,12 @@ class Trainer:
         return steps
 
     def _train_step(self) -> None:
-        planes, target_p, target_z = self.buffer.sample(self.cfg.batch_size, self.rng)
+        self._optimize(*self.buffer.sample(self.cfg.batch_size, self.rng))
+        if self.steps % self.cfg.publish_every == 0:
+            self._publish_weights()
+
+    def _optimize(self, planes, target_p, target_z) -> None:
+        """One optimiser step on a batch; the losses are logged every 10 steps."""
         self.model.train()
         logits, value = self.model(torch.from_numpy(planes_to_float(planes)))
         policy_loss = -(torch.from_numpy(target_p) * F.log_softmax(logits, dim=1)).sum(1).mean()
@@ -464,8 +501,136 @@ class Trainer:
         acc[3] += 1
         if acc[3] >= 10:
             self._log_losses()
-        if self.steps % self.cfg.publish_every == 0:
-            self._publish_weights()
+
+    # -- pre-training from another machine's positions ----------------------
+
+    def _pretrain(self) -> bool:
+        """Fit the network to the replay buffer copied from another machine, before any self-play.
+
+        A few passes in shuffled order; the newest 5% of the positions are held
+        out, and the weights after the pass with the lowest held-out loss are
+        kept (later passes can start to memorise the game results). Progress is
+        stored in state.json, so a stopped pre-training continues where it was.
+        Returns False when stopped during it.
+        """
+        cfg, bs = self.cfg, self.bootstrap
+        self.rates = {"games_per_sec": 0.0, "positions_per_sec": 0.0, "evals_per_sec": 0.0}
+        self.eval_proc, self.session_games = None, 0
+        self.loss_acc = [0.0, 0.0, 0.0, 0]
+        order = self.buffer._chronological()
+        if len(order) < cfg.batch_size:
+            self.emit({"type": "log", "message": "Pre-training skipped: the copied replay buffer is nearly empty"})
+            bs["done"] = True
+            return True
+        held = len(order) // 20 if len(order) >= 20 * cfg.batch_size else 0
+        train_ids, held_ids = order[:len(order) - held], order[len(order) - held:]
+        per_epoch = len(train_ids) // cfg.batch_size
+        epochs = bs["epochs"]
+        total = epochs * per_epoch
+        bs["steps_total"] = total
+        done = min(bs.get("steps_done", 0), total)
+        best_path = self.run_dir / "pretrain_best.pt"
+        torch.set_num_threads(CPU_COUNT)  # no self-play workers yet: the trainer may use every core
+        self.db.insert("sessions", {"elapsed": self._elapsed(), "event": "pretrain",
+                                    "detail": f"{bs['source']}'s replay buffer, {epochs} passes"})
+        self.emit({"type": "log", "message": (
+            f"Machine {self.run_dir.name}: pre-training its {cfg.blocks}x{cfg.channels} network on "
+            f"{len(order):,} positions from {bs['source']}'s replay buffer ({epochs} passes, {total:,} steps"
+            + (f", newest {held:,} held out" if held else "") + ")"
+            + (f", continuing at step {done:,}" if done else "") + ". Self-play starts afterwards.")})
+        start_time, start_done = time.time(), done
+        last_tick = last_status = time.time()
+        state = "running"
+        try:
+            while done < total:
+                epoch = done // per_epoch
+                lr = cfg.lr * (cfg.lr_drop if epochs > 1 and epoch == epochs - 1 else 1.0)  # a lower last pass
+                for group in self.optimizer.param_groups:
+                    group["lr"] = lr
+                perm = self.rng.permutation(train_ids)
+                step = done % per_epoch  # a stopped pass continues with a fresh order for its remaining steps
+                while step < per_epoch:
+                    now = time.time()
+                    paused = self.control.pause.is_set()
+                    if paused != (state == "paused"):
+                        state = "paused" if paused else "running"
+                        self.emit({"type": "log", "message": "Pre-training paused" if paused else "Pre-training resumed"})
+                        last_status = 0
+                    if not paused:
+                        self.active_seconds += now - last_tick
+                    last_tick = now
+                    if self.control.stop.is_set():
+                        self._stop_pretrain(done, total)
+                        return False
+                    if now - last_status >= 1.0:
+                        rate = (done - start_done) / max(1e-9, now - start_time)
+                        self.pretrain_status = {
+                            "source": bs["source"], "done": done, "total": total, "epoch": epoch + 1,
+                            "epochs": epochs, "eta": (total - done) / rate if rate > 0 else None}
+                        self._emit_status(state)
+                        last_status = now
+                    if paused:
+                        time.sleep(0.1)
+                        continue
+                    self._optimize(*self.buffer.batch(perm[step * cfg.batch_size:(step + 1) * cfg.batch_size]))
+                    step += 1
+                    done += 1
+                    bs["steps_done"] = done
+                self._log_losses()
+                self._end_pretrain_epoch(done // per_epoch, epochs, held_ids, best_path)
+            if best_path.exists():  # the best pass, if a later one did worse on the held-out positions
+                self.model.load_state_dict(load_checkpoint(str(best_path))["model"])
+        finally:
+            torch.set_num_threads(cfg.threads)
+            for group in self.optimizer.param_groups:
+                group["lr"] = self._lr()
+        best_path.unlink(missing_ok=True)
+        bs["done"] = True
+        self.pretrain_status = None
+        self._save_checkpoint()  # the pre-trained network becomes the first checkpoint
+        self.emit({"type": "log", "message": f"Pre-training finished after {total:,} steps"
+                                            + (f"; kept the weights after pass {bs['best_epoch']}, the best on the "
+                                               f"held-out positions" if bs.get("best_epoch", epochs) != epochs else "")})
+        return True
+
+    def _end_pretrain_epoch(self, epoch: int, epochs: int, held_ids: np.ndarray, best_path: Path) -> None:
+        bs = self.bootstrap
+        if not len(held_ids):
+            self.emit({"type": "log", "message": f"Pre-training pass {epoch}/{epochs} done"})
+            return
+        policy, value = self._held_out_loss(held_ids)
+        loss = policy + value
+        best = bs.get("best_loss")
+        if best is None or loss < best:
+            bs["best_loss"], bs["best_epoch"] = loss, epoch
+            save_checkpoint(str(best_path), self.model)
+        self.emit({"type": "log", "message": f"Pre-training pass {epoch}/{epochs}: held-out loss {loss:.3f} "
+                                            f"(policy {policy:.3f}, value {value:.3f})"
+                                            + ("" if bs["best_epoch"] == epoch else
+                                               f", above pass {bs['best_epoch']}'s {bs['best_loss']:.3f}")})
+
+    @torch.no_grad()
+    def _held_out_loss(self, ids: np.ndarray) -> tuple[float, float]:
+        self.model.eval()
+        policy = value = 0.0
+        for s in range(0, len(ids), 1024):
+            planes, target_p, target_z = self.buffer.batch(ids[s:s + 1024])
+            logits, v = self.model(torch.from_numpy(planes_to_float(planes)))
+            policy += -(torch.from_numpy(target_p) * F.log_softmax(logits, dim=1)).sum().item()
+            value += ((v - torch.from_numpy(target_z)) ** 2).sum().item()
+        return policy / len(ids), value / len(ids)
+
+    def _stop_pretrain(self, done: int, total: int) -> None:
+        self._log_losses()
+        self._save_checkpoint()  # the weights so far: the next session continues the pre-training from them
+        self._write_state("stopped")
+        self.db.insert("sessions", {"elapsed": self._elapsed(), "event": "stopped",
+                                    "detail": f"pre-training step {done} of {total}"})
+        self.db.close()
+        self.pretrain_status = None
+        self._emit_status("stopped")
+        self.emit({"type": "log", "message": f"Machine {self.run_dir.name} stopped during pre-training "
+                                            f"({done:,} of {total:,} steps); starting it again continues there"})
 
     def _log_losses(self) -> None:
         acc = self.loss_acc
@@ -495,17 +660,21 @@ class Trainer:
         save_checkpoint(str(path), self.model, self.optimizer, games=self.games, steps=self.steps,
                         positions=self.positions, elapsed=self._elapsed(), run=self.run_dir.name,
                         config=self.cfg.to_dict(), created=time.time(), engine_level=self.ladder.level,
-                        lr_scale=self.lr_scale, lr_stale=self.lr_stale, resign_threshold=self.resign_level)
+                        lr_scale=self.lr_scale, lr_since=self.lr_since, resign_threshold=self.resign_level)
         self.checkpoint = str(path)
         self._write_state("running")
         self.emit({"type": "checkpoint", "path": str(path), "name": path.name, "games": self.games})
         return path
 
     def _write_state(self, status: str) -> None:
+        extra = dict(self.run_extra)
+        if self.bootstrap:
+            extra["bootstrap"] = self.bootstrap
         write_json(self.run_dir / "state.json", {
             "status": status, "games": self.games, "steps": self.steps, "positions": self.positions,
             "elapsed": self._elapsed(), "checkpoint": self.checkpoint, "preset": self.cfg.preset,
             "engine_level": self.ladder.level if self.cfg.engine_share > 0 else None, "updated": time.time(),
+            **extra,
         })
 
     def _start_eval(self) -> None:
@@ -517,11 +686,18 @@ class Trainer:
             opponents.append(str(previous))
         self.eval_meta = {"checkpoint": ckpt.name, "games": self.games, "steps": self.steps,
                           "elapsed": self._elapsed()}
+        # earlier evaluations tie the previous checkpoint to the ladder, so its game
+        # against the new one anchors the estimate that picks the Stockfish opponents
+        history, hint = None, None
+        if self.calibration_setup:
+            history = [{"player": e["checkpoint"], "opponent": e["opponent"], "wins": e["wins"],
+                        "draws": e["draws"], "losses": e["losses"]} for e in self.db.fetch("evals")]
+            hint = self.elo["elo"] if self.elo else self._level_elo(self.ladder.level)
         self.eval_proc = self.ctx.Process(
             target=eval_process_main, daemon=True, name="chessml-eval",
             args=(str(ckpt), opponents, cfg.eval_games, cfg.eval_sims, 300, cfg.adjudicate_material,
                   not self.have_material_reference, cfg.nice, self.eval_queue, ckpt.name, self.calibration_setup,
-                  cfg.eval_calibrated_games, self.calibration_setup is not None),
+                  cfg.eval_calibrated_games, self.calibration_setup is not None, history, hint),
         )
         self.eval_proc.start()
         stockfish = " and the two calibrated Stockfish players around its Elo" if self.calibration_setup else ""
@@ -600,14 +776,16 @@ class Trainer:
     def _update_lr(self, checkpoint: str) -> None:
         """Lower the learning rate when evaluations stop finding a better checkpoint."""
         points = checkpoint_ratings(self.db.fetch("evals"), self.calibration)["checkpoints"]
-        self.lr_stale, drop = lr_after_eval(points, checkpoint, self.lr_stale, self.cfg.lr_patience)
+        _, drop = lr_after_eval(points, checkpoint, self.cfg.lr_patience, self.cfg.lr_window, self.lr_since)
         if not drop or self._lr() <= self.cfg.min_lr:
             return
         self.lr_scale *= self.cfg.lr_drop
+        self.lr_since = self.games
         for group in self.optimizer.param_groups:
             group["lr"] = self._lr()
-        self.emit({"type": "log", "message": f"Learning rate lowered to {self._lr():.2g}: no better checkpoint in the "
-                                            f"last {self.cfg.lr_patience} evaluations"})
+        self.emit({"type": "log", "message": f"Learning rate lowered to {self._lr():.2g}: the average rating over "
+                                            f"{self.cfg.lr_window} evaluations has not improved in the last "
+                                            f"{self.cfg.lr_patience}"})
 
     # -- status -----------------------------------------------------------
 
@@ -658,6 +836,7 @@ class Trainer:
             "resign_threshold": self.resign_level if self.resign_level > -1 else None,
             "resign_false": self._resign_false_rate(), "resign_checked": len(self.resign_checks),
             "engine_window": cfg.engine_window, "elo": self.elo, "calibrated": self.calibration is not None,
+            "net": f"{cfg.blocks}x{cfg.channels}", "pretrain": self.pretrain_status,
             **self.rates,
         })
 

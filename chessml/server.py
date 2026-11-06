@@ -257,6 +257,9 @@ class StartRequest(BaseModel):
     engine_level: int | None = None
     engine_adaptive: bool | None = None
     engine_path: str | None = None
+    reset_lr: bool | None = None  # undo earlier learning-rate drops for this session
+    full_search_prob: float | None = None  # share of moves with the full search (the training samples)
+    eval_games: int | None = None  # evaluation games per opponent
 
 
 @app.get("/api/info")
@@ -282,11 +285,14 @@ def start_training(req: StartRequest):
             max_seconds=max_seconds,
             eval_minutes=req.eval_minutes, checkpoint_minutes=req.checkpoint_minutes,
             engine_share=req.engine_share, engine_level=req.engine_level, engine_adaptive=req.engine_adaptive,
-            engine_path=req.engine_path or None,
+            engine_path=req.engine_path or None, reset_lr=req.reset_lr or None,
+            full_search_prob=req.full_search_prob, eval_games=req.eval_games,
         )
-        for field in ("workers", "threads", "sims", "batch_size"):
+        for field in ("workers", "threads", "sims", "batch_size", "eval_games"):
             if getattr(cfg, field) < 1:
                 raise ValueError(f"{field} must be at least 1")
+        if not 0 < cfg.full_search_prob <= 1:
+            raise ValueError("full-search share must be above 0 and at most 1")
         if not 1_000 <= cfg.buffer_size <= 5_000_000:
             raise ValueError("replay buffer must hold between 1,000 and 5,000,000 positions")
         if not 0 <= cfg.nice <= 19:
@@ -348,6 +354,10 @@ def runs():
 class MachineRequest(BaseModel):
     name: str
     checkpoint: str | None = None  # start from a copy of this checkpoint; empty = untrained
+    blocks: int | None = None  # network size of an untrained machine (default: the configured 4x48)
+    channels: int | None = None
+    pretrain_from: str | None = None  # machine whose replay buffer it pre-trains on before self-play
+    pretrain_passes: int | None = None
 
 
 @app.post("/api/machines")
@@ -355,7 +365,9 @@ def create_machine(req: MachineRequest):
     """A new machine (run directory), untrained or starting from a checkpoint."""
     try:
         source = resolve_checkpoint(req.checkpoint) if req.checkpoint else None
-        path = create_run(req.name, source)
+        extra = {} if req.pretrain_passes is None else {"bootstrap_epochs": req.pretrain_passes}
+        path = create_run(req.name, source, blocks=req.blocks, channels=req.channels,
+                          bootstrap=req.pretrain_from or None, **extra)
     except FileExistsError as exc:
         raise HTTPException(409, str(exc))
     except (ValueError, FileNotFoundError) as exc:

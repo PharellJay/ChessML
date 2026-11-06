@@ -235,7 +235,12 @@ function renderMachine() {
     return;
   }
   const origin = run.origin ? ` · started from ${shortPath(run.origin)}` : "";
-  $id("machineInfo").textContent = `${run.status} · ${fmtInt(run.games)} games · ${fmtDuration(run.elapsed)} trained${origin}`;
+  const net = run.net ? ` · ${run.net.blocks}×${run.net.channels} network` : "";
+  const b = run.bootstrap;
+  const pre = !b ? "" : b.done ? ` · pre-trained on ${b.source}'s positions`
+    : ` · pre-trains on ${fmtInt(b.positions)} positions from ${b.source} when started` +
+      (b.steps_done && b.steps_total ? ` (${Math.round(100 * b.steps_done / b.steps_total)}% done)` : "");
+  $id("machineInfo").textContent = `${run.status} · ${fmtInt(run.games)} games · ${fmtDuration(run.elapsed)} trained${net}${origin}${pre}`;
   const ckpts = (state.ckpts || []).filter((c) => c.run === name);
   $id("machineCkpts").hidden = false;
   $id("ckptCount").textContent = `(${ckpts.length})`;
@@ -265,6 +270,12 @@ function openMachineDialog(from = "") {
   $id("machineFrom").innerHTML = `<option value="">An untrained network</option>` +
     (state.ckpts || []).map((c) => `<option value="${esc(c.path)}">${esc(c.label)}</option>`).join("");
   $id("machineFrom").value = from;
+  $id("machinePretrain").innerHTML = `<option value="">Nothing: learn from scratch</option>` +
+    state.runs.filter((r) => r.has_buffer).map((r) => `<option value="${esc(r.name)}">${esc(r.name)}'s replay buffer` +
+      `${r.net ? ` (${r.net.blocks}×${r.net.channels}, ${fmtInt(r.games)} games)` : ""}</option>`).join("");
+  $id("machineSize").value = "4x48";
+  $id("machinePretrain").value = "";
+  syncMachineDialog();
   $id("machineName").value = "";
   $id("machineError").textContent = "";
   $id("machineDialog").showModal();
@@ -272,10 +283,18 @@ function openMachineDialog(from = "") {
 }
 $id("btnNewMachine").addEventListener("click", () => openMachineDialog());
 $id("machineCancel").addEventListener("click", () => $id("machineDialog").close());
+function syncMachineDialog() {  // size and pre-training apply to an untrained network only
+  $id("machineNew").disabled = Boolean($id("machineFrom").value);
+}
+$id("machineFrom").addEventListener("change", syncMachineDialog);
 $id("machineForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
-    const m = await api("/api/machines", { name: $id("machineName").value, checkpoint: $id("machineFrom").value || null });
+    const fromCkpt = $id("machineFrom").value || null;
+    const [blocks, channels] = $id("machineSize").value.split("x").map(Number);
+    const m = await api("/api/machines", fromCkpt ? { name: $id("machineName").value, checkpoint: fromCkpt } : {
+      name: $id("machineName").value, blocks, channels, pretrain_from: $id("machinePretrain").value || null,
+    });
     $id("machineDialog").close();
     log(`Created machine ${m.name}`);
     await refreshRuns(m.name);
@@ -309,7 +328,11 @@ function renderStatus(s) {
   $id("st-elapsed").textContent = fmtDuration(s.elapsed);
   const showEta = ["running", "paused"].includes(s.state) && s.eta !== null && s.eta !== undefined;
   $id("st-eta").textContent = showEta ? fmtDuration(s.eta) : "–";
-  $id("st-games").textContent = s.games === undefined ? "–" : `${fmtInt(s.games)}${s.max_games ? ` (${fmtInt(s.session_games)} / ${fmtInt(s.max_games)} this session)` : ""}`;
+  $id("st-games").textContent = s.games === undefined ? "–" : s.pretrain
+    ? `pre-training on ${s.pretrain.source}'s positions: ${Math.round(100 * s.pretrain.done / s.pretrain.total)}% ` +
+      `(pass ${s.pretrain.epoch}/${s.pretrain.epochs}${s.pretrain.eta == null ? "" : `, about ${fmtDuration(s.pretrain.eta)} left`}), ` +
+      `then self-play`
+    : `${fmtInt(s.games)}${s.max_games ? ` (${fmtInt(s.session_games)} / ${fmtInt(s.max_games)} this session)` : ""}`;
   $id("st-gps").textContent = fmtNum(s.games_per_sec);
   $id("st-positions").textContent = fmtInt(s.positions);
   $id("st-eps").textContent = s.evals_per_sec === undefined ? "–" : fmtInt(Math.round(s.evals_per_sec));
@@ -340,6 +363,9 @@ function updatePresetHint() {
     `batch ${p.batch_size} · nice ${p.nice} · buffer ${fmtInt(p.buffer_size)} positions ` +
     `(about ${Math.round((p.buffer_size * 1.85) / 1000)} MB) · this machine has ${state.info.cpu_count} CPUs`;
   for (const k of ["workers", "threads", "sims", "batch_size", "nice", "buffer_size"]) $id(k).placeholder = p[k];
+  const d = state.info.defaults || {};
+  if (d.full_search_prob !== undefined) $id("fullSearchPct").placeholder = Math.round(100 * d.full_search_prob);
+  if (d.eval_games !== undefined) $id("eval_games").placeholder = d.eval_games;
 }
 $id("preset").addEventListener("change", updatePresetHint);
 
@@ -362,6 +388,9 @@ $id("trainForm").addEventListener("submit", async (e) => {
     duration: document.querySelector("input[name=duration]:checked").value,
     games: num("games"), time: $id("time").value,
     resume: $id("machine").value || null,
+    reset_lr: $id("resetLr").checked,
+    full_search_prob: num("fullSearchPct") === null ? null : num("fullSearchPct") / 100,
+    eval_games: num("eval_games"),
   };
   if (!body.resume) { $id("trainError").textContent = "Create a machine first (New machine)."; return; }
   if ($id("mode").value === "engine") {
@@ -372,6 +401,7 @@ $id("trainForm").addEventListener("submit", async (e) => {
   }
   try {
     renderStatus(await api("/api/training/start", body));
+    $id("resetLr").checked = false;  // a one-off: the next start keeps the rate it reaches
     log(`Starting ${body.preset} training of ${body.resume}…`);
   } catch (err) { $id("trainError").textContent = err.message; }
 });

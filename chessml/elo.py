@@ -431,6 +431,24 @@ def level_elo(calibration: dict | None, level: float, nodes: int, multipv: int) 
     return None
 
 
+def bracket_estimate(calibration: dict, records: list[dict], name: str, history: list[dict] | None = None,
+                     hint: float | None = None) -> float:
+    """A first Elo estimate of `name`, used to choose the Stockfish players to evaluate it against.
+
+    `records` are its games so far in this evaluation. They usually include the
+    previously evaluated checkpoint, which `history` (the run's earlier
+    evaluation records) ties to the calibrated ladder; without it that game is
+    no anchor at all. A clean sweep (or a clean loss) gives no finite estimate:
+    the fit would drift to the top (bottom) of the ladder, where every game is
+    lost (won) and tells nothing. Then `hint`, the last known Elo, is used.
+    """
+    own = [r for r in records if r["player"] == name]
+    wins, draws, losses = (sum(r[k] for r in own) for k in ("wins", "draws", "losses"))
+    if hint is not None and draws == 0 and (wins == 0 or losses == 0):
+        return hint
+    return fit_with_calibration(calibration, list(history or []) + list(records))[0][name]
+
+
 def bracket_players(calibration: dict, rating: float) -> list[str]:
     """The calibrated Stockfish players just below and just above `rating` (the two nearest at either end).
 

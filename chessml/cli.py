@@ -37,6 +37,13 @@ def _add_training_args(p: argparse.ArgumentParser) -> None:
     r.add_argument("--resume", metavar="RUN_OR_CHECKPOINT",
                    help="continue a run (name or path) or start a new run from a checkpoint file")
     r.add_argument("--name", help="name for a new run directory")
+    r.add_argument("--pretrain-from", metavar="RUN",
+                   help="new runs: first pre-train the network on this run's saved replay buffer, then self-play "
+                        "(e.g. --name Faker2 --blocks 8 --channels 96 --pretrain-from Faker)")
+    r.add_argument("--pretrain-passes", type=int, default=4,
+                   help="passes over that buffer when pre-training (default 4)")
+    r.add_argument("--reset-lr", action="store_true",
+                   help="when resuming: undo earlier learning-rate drops (back to --lr) and restart the plateau rule")
     a = p.add_argument_group("advanced")
     a.add_argument("--parallel-games", type=int, help="games searched together per worker")
     a.add_argument("--blocks", type=int, help="residual blocks (new runs only)")
@@ -69,6 +76,7 @@ def config_from_args(args) -> TrainConfig:
         "engine_share": args.engine_share, "engine_path": args.engine_path, "engine_level": args.engine_level,
         "engine_nodes": args.engine_nodes, "buffer_size": args.buffer_size,
         "engine_adaptive": False if args.engine_fixed else None, "engine_imitate": False if args.no_imitate else None,
+        "reset_lr": True if args.reset_lr else None,
     }
     return TrainConfig.from_preset(args.preset, **overrides)
 
@@ -100,6 +108,13 @@ class ConsolePrinter:
                 score = event.get("engine_score")
                 engine = (f" | stockfish level {event['engine_level']}"
                           + (f", score {100 * score:.0f}%" if score is not None else ""))
+            pre = event.get("pretrain")
+            if pre:
+                eta = f" | eta {format_duration(pre['eta'])}" if pre.get("eta") is not None else ""
+                print(f"[{format_duration(event['elapsed'])}] pre-training on {pre['source']}'s positions | "
+                      f"pass {pre['epoch']}/{pre['epochs']} | step {pre['done']}/{pre['total']} "
+                      f"({100 * pre['done'] / pre['total']:.0f}%) | {loss}{eta}", flush=True)
+                return
             print(f"[{format_duration(event['elapsed'])}] {event['state']} | games {event['games']} "
                   f"({event['games_per_sec']:.2f}/s) | steps {event['steps']} | {loss} | "
                   f"buffer {event['buffer']}{engine}{eta}", flush=True)
@@ -116,6 +131,23 @@ def cmd_train(args) -> int:
     except (ValueError, FileNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    resume = args.resume
+    if args.pretrain_from:
+        from .runs import create_run
+
+        if resume:
+            print("error: --pretrain-from starts a new run; it cannot be combined with --resume", file=sys.stderr)
+            return 2
+        name = args.name or f"{args.pretrain_from}-{cfg.blocks}x{cfg.channels}"
+        try:
+            run = create_run(name, blocks=cfg.blocks, channels=cfg.channels, bootstrap=args.pretrain_from,
+                             bootstrap_epochs=args.pretrain_passes)
+        except (ValueError, FileNotFoundError, FileExistsError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"Created machine {run.name}: {cfg.blocks}x{cfg.channels} network, pre-training on "
+              f"{args.pretrain_from}'s replay buffer first", flush=True)
+        resume = str(run)
     control = Control()
     presses = 0
 
@@ -134,7 +166,7 @@ def cmd_train(args) -> int:
     print(f"Training: preset {cfg.preset} ({CPU_COUNT} CPUs) workers={cfg.workers} threads={cfg.threads} "
           f"sims={cfg.sims} batch={cfg.batch_size} nice={cfg.nice} | {cfg.duration_text()} | {cfg.opponent_text()}",
           flush=True)
-    trainer = Trainer(cfg, control, ConsolePrinter(), resume=args.resume, run_name=args.name)
+    trainer = Trainer(cfg, control, ConsolePrinter(), resume=resume, run_name=args.name)
     reason = trainer.run()
     print(f"Run directory: {trainer.run_dir}")
     return 0 if reason in ("completed", "stopped") else 1

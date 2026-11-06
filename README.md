@@ -25,19 +25,25 @@ watch it live, and play against any checkpoint.
 
 ## Watch it play
 
-| A fresh machine: its first game | After 24 hours of training |
+| A fresh machine: its first game | After 62,675 games of training |
 |---|---|
-| ![An untrained network playing itself](docs/games/fresh-machine.gif) | <!-- 24h GIF placeholder: replace this cell with ![After 24 hours of training](docs/games/machine-24h.gif) --> *Placeholder: rendered after a 24-hour run, see below.* |
+| ![An untrained network playing itself](docs/games/fresh-machine.gif) | ![The same network size after 62,675 games of training, playing itself](docs/games/faker-62675g.gif) |
 
 Both games are the network against itself, from the start position, under
-the training rules (200-ply limit, then material adjudication). The fresh
-machine is an untrained network, the `ckpt_000000g.pt` that every new
-machine starts as. Its moves are close to random, and this game drifted into
-a draw by repetition after 168 plies. To render the right-hand game:
+the training rules (200-ply limit, then material adjudication), with 64
+simulations per move. The fresh machine is an untrained network, the
+`ckpt_000000g.pt` that every new machine starts as. Its moves are close to
+random, and this game drifted into a draw by repetition after 168 plies.
+The trained one is the final checkpoint of the machine `Faker`
+(`ckpt_062675g.pt`, the default 4 x 48 network): 62,675 games over 23
+hours of training on a 12-thread laptop, mostly on the Hardcore preset with
+half to three quarters of the games against Stockfish. Its game ends with
+Black mating after 150 plies. To render the right-hand game from your own
+machine:
 
 ```bash
-python -m chessml train --preset hardcore --time 24h --name machine-24h
-python -m chessml gif machine-24h --title "After 24 hours of training" --out docs/games/machine-24h.gif
+python -m chessml train --preset hardcore --engine-share 0.5 --name Faker   # Ctrl+C or Stop when you like
+python -m chessml gif Faker --title "After 62,675 games of training" --out docs/games/faker-62675g.gif
 ```
 
 `gif` takes any checkpoint, run name or label, and can play against an
@@ -92,8 +98,14 @@ or `sf-elo-N` (Stockfish), or another checkpoint file.
    visit distribution is the policy target, and the game result (from that
    position's side to move) is the value target. The trainer samples each
    position about 4 times, then sends the new weights to the workers. When
-   three evaluations in a row find no checkpoint better than the best so
-   far, the learning rate drops to 30% (down to 1e-5).
+   three evaluations in a row do not beat the best rating since the last
+   learning-rate change, the learning rate drops to 30%, but never below
+   1e-4. Each checkpoint counts with the average rating of the last three
+   evaluations, because a single 10-game evaluation is too noisy: one lucky
+   result would otherwise set a best that nothing reaches again. Drops are
+   saved in the checkpoints. To undo them for a stalled machine, resume it
+   with `--reset-lr` (or tick *Reset the learning rate* under *Manual
+   overrides* in the web interface).
 5. **Measure.** A separate process regularly plays the newest checkpoint
    against three opponents: a random mover, a greedy material-capture
    baseline, and the previously evaluated checkpoint. Ratings are fitted on
@@ -166,15 +178,136 @@ several GB.
 The web interface needs no build step and no internet access: chessboard.js,
 chess.js, jQuery and the piece images are vendored in `chessml/static/vendor/`.
 
+## Starting the web interface
+
+The whole web interface (training dashboard, Play tab, Strength tab) is served
+by one command, `python -m chessml serve`. Nothing else has to run first:
+there is no separate frontend build, database server or background service.
+
+### Every time you want to use it
+
+Open a terminal and run:
+
+```bash
+cd ~/path/to/ChessML               # 1. the repository root (the folder with README.md)
+source .venv/bin/activate          # 2. the virtual environment from "Install"
+python -m chessml serve            # 3. start the server
+```
+
+After about 1.5 seconds your default browser opens **http://127.0.0.1:8000/**.
+The terminal prints:
+
+```
+ChessML web interface: http://127.0.0.1:8000/  (Ctrl+C stops training gracefully and exits)
+```
+
+Leave that terminal open: the website runs only while this command runs.
+
+Notes on each step:
+
+1. **Start from the repository root.** Training machines are read from and
+   written to `runs/` *relative to the current folder*. If you start the
+   server from anywhere else, the page loads but your machines and
+   checkpoints are missing (only the bundled `models/best.pt` shows up), and
+   new runs end up in a stray `runs/` folder. To keep runs somewhere else on
+   purpose, set `CHESSML_RUNS=/some/folder`.
+2. **Activate the virtual environment** in every new terminal. When it is
+   active, the prompt starts with `(.venv)`. You can also skip activation and
+   call the venv's Python directly: `.venv/bin/python -m chessml serve`.
+3. **`python -m chessml serve`** runs the FastAPI app with uvicorn. It needs
+   no internet access: all JavaScript libraries and piece images are bundled
+   in `chessml/static/vendor/`.
+
+### Options
+
+| Option | Default | What it does |
+|---|---|---|
+| `--port N` | `8000` | Port to listen on. Use another one if 8000 is taken, e.g. `--port 8001`. |
+| `--host ADDR` | `127.0.0.1` | Address to listen on. The default is reachable only from this computer. |
+| `--no-browser` | off | Don't open a browser window, for example on a headless machine or over SSH. |
+
+```bash
+python -m chessml serve --port 8001                 # second instance or port 8000 busy
+python -m chessml serve --no-browser                # just print the URL
+```
+
+The Strength tab can be opened directly at `http://127.0.0.1:8000/#strength`.
+
+### Stopping it
+
+Press **Ctrl+C** in the terminal that runs the server.
+
+- If training is running, it is **stopped gracefully first**: unfinished games
+  are discarded and a checkpoint is saved, so nothing that was learned is lost.
+  This can take up to about two minutes. The terminal shows
+  `Stopping training gracefully before exit...` while it waits.
+- A running Elo calibration or measurement is cancelled. The previous
+  calibration is kept.
+
+**Closing the browser tab does not stop anything.** Training keeps running in
+the server's processes. Open the URL again at any time and the dashboard
+reconnects and shows the live state. Only Ctrl+C ends the server cleanly.
+Closing the terminal window kills it **without** the graceful stop, which
+loses the progress since the last checkpoint (by default a checkpoint is written
+every 10 minutes), so prefer Ctrl+C.
+
+### Continuing where you left off
+
+Everything the page shows is stored on disk in `runs/` (one folder per
+machine: checkpoints, configuration and `metrics.db` with the chart history),
+plus `runs/elo_calibration.json` and `runs/elo_results.json` for the Strength
+tab. Restarting the server therefore loses nothing:
+
+1. Start the server as above.
+2. In the **Train** tab, pick your machine in the **Machine** selector.
+3. Press **Start**. Training continues from the machine's latest checkpoint.
+
+`runs/` is in `.gitignore`, so **it is never pushed to GitHub**. A fresh clone
+contains only `models/best.pt`. To move your machines to another computer or
+into another copy of the repository, copy the `runs/` folder by hand.
+
+### Using it from another computer
+
+The server has **no login and no access control**: anyone who can reach it
+can start and stop training. Keep the default `127.0.0.1` and use an SSH
+tunnel instead of opening it to the network:
+
+```bash
+# on the training machine
+python -m chessml serve --no-browser
+# on your laptop, then open http://127.0.0.1:8000/ there
+ssh -L 8000:127.0.0.1:8000 user@training-machine
+```
+
+`--host 0.0.0.0` makes it reachable from your whole local network. Only use
+that on a network you trust.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `ModuleNotFoundError: No module named 'torch'` (or `fastapi`, `chess`, ...) | The virtual environment isn't active. Run `source .venv/bin/activate`, or install the requirements (see [Install](#install)). |
+| `No module named chessml` | You're not in the repository root. `cd` into the folder that contains `chessml/` and `README.md`. |
+| `[Errno 98] address already in use` | Another program, or a server you forgot about in another terminal, uses port 8000. Stop it, or start with `--port 8001`. `ss -ltnp \| grep 8000` shows which process holds the port. |
+| `bad interpreter: No such file or directory`, or `pip` installs into the wrong place | The `.venv` folder was **copied or moved** from another location. Virtual environments store absolute paths and break when moved. Delete it and create it again: `rm -rf .venv`, then follow [Install](#install). |
+| The browser doesn't open | Normal over SSH or without a desktop. Open the printed URL yourself. |
+| The page loads but my machines are missing | The server was started outside the repository root, or `runs/` wasn't copied along. See step 1 above. |
+| Training against Stockfish / the Strength tab says Stockfish was not found | Install it (`sudo apt install stockfish`) or point to it with `CHESSML_ENGINE=/path/to/stockfish`. Self-play training and the Play tab work without it. |
+| The page looks outdated after an update | Hard-refresh the browser (Ctrl+Shift+R) so it loads the new JavaScript and CSS. |
+| The rest of the computer feels slow while training | Pick a lighter preset. Training processes already lower their own priority, while the web server keeps normal priority so the page stays responsive. |
+
 ## Quick start
 
 ```bash
+cd ChessML && source .venv/bin/activate
 python -m chessml serve            # opens http://127.0.0.1:8000/
 ```
 
 In the browser, pick a preset, pick a duration and press **Start**. Charts and
 the live board update as training runs. The **Play** tab plays against any
-checkpoint, including the bundled `models/best.pt`, right after cloning.
+checkpoint, including the bundled `models/best.pt`, right after cloning. See
+[Starting the web interface](#starting-the-web-interface) for options,
+stopping, resuming and troubleshooting.
 
 The same from the terminal:
 
@@ -183,7 +316,9 @@ python -m chessml train --preset balanced --time 2h      # wall-clock limit
 python -m chessml train --preset heavy --games 2000      # game limit
 python -m chessml train --preset light                   # until Ctrl+C
 python -m chessml train --resume run-20261029-101500     # continue a run
+python -m chessml train --resume run-20261029-101500 --reset-lr   # continue at the full learning rate again
 python -m chessml train --resume runs/x/checkpoints/ckpt_000500g.pt   # new run from a checkpoint
+python -m chessml train --name Big --blocks 8 --channels 96 --pretrain-from Faker   # bigger net, pre-trained on Faker's positions
 python -m chessml train --preset heavy --engine-share 0.5 --time 1h   # half the games vs Stockfish
 python -m chessml evaluate run-20261029-101500 --games 40
 python -m chessml calibrate                              # once: Elo ladder against Stockfish
@@ -215,6 +350,21 @@ one and Start continues it. *New machine* creates one, either untrained or
 starting from a copy of any checkpoint (*Fork* on a checkpoint does the
 same).
 
+**A bigger network.** A machine's network size is fixed when it is created:
+weights of one size cannot be loaded into another. To grow past a machine
+that has plateaued, create a new one with a larger size and let it
+**pre-train on the old machine's replay buffer** (*New machine* → *Network
+size* and *Pre-train on*, or `--blocks/--channels --pretrain-from` on the
+command line). The old machine's saved buffer (written when a session stops)
+is copied in; the new machine's first session fits its network to those
+positions for 4 passes (`--pretrain-passes`) using every core, holding out
+the newest 5% and keeping the pass with the lowest held-out loss. Self-play
+starts afterwards from the pre-trained network, which becomes the first
+checkpoint. Stopping during pre-training saves its progress, and the next
+start continues it. On a 12-thread laptop, the 8 x 96 machine `PJ-Bot`
+pre-trained on the 300,000 positions of the 4 x 48 machine `Faker`
+(285,000 for training, 15,000 held out) in about 1 hour 17 minutes.
+
 **Intensity.** Presets are computed from the number of logical CPUs:
 
 | Preset | Self-play workers | Trainer threads | Sims/move | Batch | Niceness | Replay buffer | On 4 CPUs | On 12 CPUs |
@@ -232,7 +382,9 @@ replay buffer keeps three times as many. Override any value with
 `--workers`, `--threads`, `--sims`, `--batch-size`, `--nice` and
 `--buffer-size`, or in the UI under *Manual overrides*.
 `--full-search-prob`, `--fast-sims` and `--resign-threshold` (-1 turns
-resignation off) tune the search effort and resignation. `python -m chessml list`
+resignation off) tune the search effort and resignation. *Manual overrides*
+also has the full-search share, the evaluation games per opponent
+(`--eval-games`, 10 by default) and *Reset the learning rate*. `python -m chessml list`
 prints the presets for your machine.
 
 **Why the UI stays responsive.** Trainer, workers and evaluator are separate
@@ -397,10 +549,10 @@ calibrated fits use only a token 0.01.
 
 ![Train tab](docs/ui-train.png)
 
-In this screenshot the metrics show the reported `hardcore-60m` run (picked
-in the **Run** selector, now called **Machine**). The status panel and live board come from a short
-session started from that run's final checkpoint, which is why its counters
-continue from 1,670 games.
+In this screenshot the metrics show the reported `hardcore-60m` run, picked
+in the **Machine** selector (called **Run** when the screenshot was taken).
+The status panel and live board come from a short session started from that
+run's final checkpoint, which is why its counters continue from 1,670 games.
 
 - *Training* (left): the **machine** to train, with *New machine* and the
   machine's checkpoints. Each checkpoint has *Play* (open it in the Play tab),
@@ -411,7 +563,8 @@ continue from 1,670 games.
 - *Status*: state, machine, preset, elapsed time, ETA, games played, games/s,
   positions, network evaluations/s, training steps, learning rate,
   resignation (threshold, and how many checked resignations would have been
-  wrong), replay buffer size and current checkpoint.
+  wrong), replay buffer size and current checkpoint. While a new machine
+  pre-trains, the games field shows the pre-training progress instead.
 - *Live training games*: a thumbnail of every game in progress, across all
   workers (Stockfish games marked), refreshed once a second. Click one to
   follow it in the large view: the network's value estimate (raw and after
@@ -586,9 +739,9 @@ tests/           pytest suite
 
 - **The strength ceiling is low.** AlphaZero trained for millions of games
   with 800 simulations per move on thousands of TPUs. An hour on a few CPU
-  cores gives a few thousand games with a 266k-parameter network. Expect an
-  engine that captures material and mates weak opponents, not one that
-  plays sound chess. Longer runs keep improving, but slowly.
+  cores gives a few thousand games with the default 266k-parameter network.
+  Expect an engine that captures material and mates weak opponents, not one
+  that plays sound chess. Longer runs keep improving, but slowly.
 - **Material adjudication is domain knowledge.** It speeds up early learning,
   but it also teaches the network to value material the way the adjudication
   rule does. Set `--max-plies` high to rely on real game results instead.

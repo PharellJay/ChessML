@@ -278,15 +278,18 @@ def evaluate_checkpoint(checkpoint: str, opponents: list[str], games: int, sims:
                         max_plies: int = 300, adjudicate_material: int = 3,
                         include_material_reference: bool = False, seed: int | None = None,
                         calibration: dict | None = None, calibrated_games: int | None = None,
-                        bracket: bool = False) -> list[dict]:
+                        bracket: bool = False, history: list[dict] | None = None,
+                        hint: float | None = None) -> list[dict]:
     """Play `checkpoint` against each opponent ('random', 'material', a checkpoint
     path, or the name of a player in `calibration`).
 
     Returns one record per match. With `include_material_reference`, also
     plays the material baseline against random so it can be rated.
     Calibrated Stockfish opponents get `calibrated_games` games (default: `games`).
-    With `bracket`, the checkpoint's Elo is then estimated from these games,
-    and it also plays the two calibrated Stockfish players around it.
+    With `bracket`, the checkpoint's Elo is then estimated from these games
+    (with the run's earlier evaluation records `history`, and the last known
+    Elo `hint` as a fallback, see elo.bracket_estimate), and it also plays the
+    two calibrated Stockfish players around it.
     """
     rng = random.Random(seed)
     player = NetPlayer(checkpoint, sims)
@@ -319,17 +322,17 @@ def evaluate_checkpoint(checkpoint: str, opponents: list[str], games: int, sims:
                 opponent.close()
         records.append({"player": player.name, "opponent": opponent.name, **res})
         if bracket and calibration and i == len(opponents):
-            from .elo import bracket_players, fit_with_calibration
+            from .elo import bracket_estimate, bracket_players
 
             bracket = False
-            estimate = fit_with_calibration(calibration, records)[0][player.name]
+            estimate = bracket_estimate(calibration, records, player.name, history, hint)
             opponents += [p for p in bracket_players(calibration, estimate) if p not in opponents]
     return records
 
 
 def eval_process_main(checkpoint, opponents, games, sims, max_plies, adjudicate_material,
                       include_material_reference, nice, result_queue, tag, calibration=None, calibrated_games=None,
-                      bracket=False):
+                      bracket=False, history=None, hint=None):
     """Entry point for the background evaluation process started by the trainer."""
     from .config import apply_niceness
 
@@ -341,7 +344,8 @@ def eval_process_main(checkpoint, opponents, games, sims, max_plies, adjudicate_
     try:
         records = evaluate_checkpoint(checkpoint, opponents, games, sims, max_plies,
                                       adjudicate_material, include_material_reference, calibration=calibration,
-                                      calibrated_games=calibrated_games, bracket=bracket)
+                                      calibrated_games=calibrated_games, bracket=bracket, history=history,
+                                      hint=hint)
         result_queue.put({"tag": tag, "records": records})
     except Exception as exc:  # report instead of dying silently
         result_queue.put({"tag": tag, "error": repr(exc)})

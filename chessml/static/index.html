@@ -58,8 +58,14 @@
               <label>Batch size <input type="number" id="batch_size" min="1" max="8192"></label>
               <label>Niceness <input type="number" id="nice" min="0" max="19"></label>
               <label>Replay buffer (positions) <input type="number" id="buffer_size" min="1000" max="5000000" step="1000"></label>
+              <label>Full-search share % <input type="number" id="fullSearchPct" min="1" max="100" placeholder="25"></label>
+              <label>Eval games / opponent <input type="number" id="eval_games" min="1" max="1000" placeholder="10"></label>
             </div>
-            <p class="hint">Empty fields use the preset value.</p>
+            <p class="hint">Empty fields use the preset value. Full-search share: the moves searched with all
+              simulations, which become training samples; the others get a quick 16-simulation search.</p>
+            <label class="toggle"><input type="checkbox" id="resetLr"> Reset the learning rate</label>
+            <p class="hint">Undoes the machine's earlier learning-rate drops for this session (back to the
+              starting rate). Use it when a machine has stalled at a low rate.</p>
           </details>
           <label>Mode
             <select id="mode">
@@ -182,6 +188,22 @@
       <select id="machineFrom"><option value="">An untrained network</option></select>
     </label>
     <p class="hint">Starting from a checkpoint copies it into the new machine, which then trains on from there.</p>
+    <fieldset id="machineNew" class="machine-new">
+      <label>Network size
+        <select id="machineSize">
+          <option value="4x48">4×48: small, fastest (default)</option>
+          <option value="6x64">6×64: medium, self-play about 1.5× slower</option>
+          <option value="8x96">8×96: large, self-play about 3× slower</option>
+          <option value="10x128">10×128: very large, about 6–7× slower (GPU or big CPU)</option>
+        </select>
+      </label>
+      <label>Pre-train on
+        <select id="machinePretrain"><option value="">Nothing: learn from scratch</option></select>
+      </label>
+      <p class="hint" id="machinePretrainHint">Pre-training fits the new network to another machine's saved
+        positions before its first self-play game, so it does not start from zero. It runs in the first
+        training session (about 1–2 hours for 8×96 on 300,000 positions) and can be stopped and resumed.</p>
+    </fieldset>
     <p class="error" id="machineError" role="alert"></p>
     <div class="buttons">
       <button type="submit" class="primary">Create machine</button>
